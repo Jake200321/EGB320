@@ -1,248 +1,259 @@
 """
-Vision System
-====================================================================
-Version: v3 (rebuilt as three independent, modular layers -- colour,
-shape, and marker detection -- combined only here. Filename kept as
-vision_system_v2_0.py to match the existing run command; the version
-number that matters is this comment, not the filename.)
+Camera capture wrapper.
 
-Top-level orchestrator. Wires together the three independent detection
-layers this project is now built from, keeping each one doing only its
-own job -- this file's ONLY responsibility is combining their output, not
-detecting anything itself:
+picamera2 (the standard Raspberry Pi camera library) returns frames as
+NumPy arrays in RGB channel order. OpenCV's entire colour pipeline --
+cv2.cvtColor, cv2.inRange, the HSV masking this project relies on -- assumes
+BGR order. Feed a raw picamera2 frame straight into that pipeline and every
+hue calibrated in calibrate.py will be wrong: reds and blues swap, greens
+shift, even though nothing else in the code is broken.
 
-    colour_detector.ColourDetector
-        Finds coloured blobs. Classes with a distinct band become a
-        single-class candidate; obstacle/door (same band) come back as an
-        ambiguous two-class candidate, carrying its own pixel mask.
+This file does the RGB -> BGR conversion once, in one place, so nothing
+downstream (vision_system.py) has to know or care which camera is attached.
 
-    shape_detector.resolve_candidates
-        Resolves the one ambiguity colour can't: obstacle vs door, using
-        the hole + straight-edge geometry check. Passes every other
-        (already unambiguous) candidate straight through unchanged.
-
-    detectors.marker_detector.MarkerDetector
-        A completely separate modality -- grayscale template matching for
-        wall placards. Has nothing to do with colour or the shape check
-        above; its detections just get merged into the same output list.
-
-None of these three modules import or know about each other. Swapping one
-out (e.g. giving victim/rubble/ramp their own shape confirmation later)
-or adding a fourth layer means editing THIS file's classify_frame, not the
-layers themselves.
-
-Run:
-    python3 vision_system_v2_0.py
+Falls back to a normal USB webcam via cv2.VideoCapture if picamera2 isn't
+installed, so the vision pipeline can still be developed/tested on a laptop
+before being deployed to the Pi.
 """
 
 import cv2
-from detectors.colour_detector import ColourDetector
-from detectors.shape_detector import resolve_candidates
-from detectors.marker_detector import MarkerDetector
-from camera_capture_v2_0 import (
-    CameraCapture, pixel_x_to_angle, ground_distance_from_bbox_bottom,
-    CAMERA_HEIGHT_M, CAMERA_TILT_DEG, VERTICAL_FOV_DEG,
-)
+import math
+
+try:
+    from picamera2 import Picamera2
+    PICAMERA_AVAILABLE = True
+except ImportError:
+    PICAMERA_AVAILABLE = False
 
 # ---------------- Constants ----------------
-# Confidence is assigned HERE, at the fusion level -- not inside either
-# detection layer -- because it depends on how many layers actually had to
-# agree. A class colour identified on its own (ramp, victim, rubble: each
-# has a distinct band, nothing to resolve) is more certain than one colour
-# could only narrow down to two options, with shape breaking the tie
-# (obstacle vs door).
-COLOUR_ONLY_CONFIDENCE = 0.8
-SHAPE_RESOLVED_CONFIDENCE = 0.7
+FRAME_SIZE = (640, 480)
+USB_CAMERA_INDEX = 0
 
-# Bounding boxes overlapping more than this, from ANY of the three layers,
-# are treated as "the same object" -- keep only the higher-confidence one.
-OVERLAP_IOU_THRESHOLD = 0.3
+# Camera's HORIZONTAL field of view -- update this if the lens/camera ever
+# changes. Everything that computes a bearing angle to a detected object
+# depends on this being accurate; a wrong FOV here silently miscalibrates
+# every angle downstream even though the pixel math is otherwise correct.
+HORIZONTAL_FOV_DEG = 45.0
 
-# Variance of the Laplacian is a standard cheap sharpness proxy: a crisp
-# image has strong edges everywhere, so the second-derivative filter's
-# output varies a lot pixel to pixel; a motion-blurred frame smears those
-# edges out, so the variance collapses toward zero. A frame scoring below
-# this is treated as unusable -- every downstream check (colour survives
-# blur reasonably well, but ORB and template matching do not) gets worse
-# on a blurred frame, so there's no point running any of them on one.
+
+def pixel_x_to_angle(x, frame_width, fov_deg=HORIZONTAL_FOV_DEG):
+    """Converts a pixel's horizontal position into a bearing angle in
+    degrees: 0 = straight ahead, negative = left of centre, positive =
+    right of centre. Uses a pinhole-camera model (see the module-level
+    reasoning above this function) rather than assuming pixel offset
+    scales linearly with angle, which breaks down at wider FOVs."""
+    half_width = frame_width / 2
+    half_fov_rad = math.radians(fov_deg / 2)
+    normalised_offset = (x - half_width) / half_width  # -1 .. +1 across the frame
+    return math.degrees(math.atan(normalised_offset * math.tan(half_fov_rad)))
+
+
+# ---- Ground-plane distance estimation ------------------------------------
+# Requires three physical values that CANNOT be safely guessed -- get any
+# of these wrong and every distance is silently, confidently wrong (not
+# just a bit noisy), which is worse for navigation than having no distance
+# at all. Measure them on the real robot and set them here before trusting
+# any output from ground_distance_from_bbox_bottom.
+CAMERA_HEIGHT_M = None    # camera's height above the floor, in metres
+CAMERA_TILT_DEG = None    # how far the camera points DOWN from level --
+                           # 0.0 if mounted perfectly horizontal
+
+# A SEPARATE number from HORIZONTAL_FOV_DEG -- don't assume a lens is
+# symmetric. If your camera's spec only gives a horizontal figure, this
+# approximates the vertical one for a simple rectilinear lens with square
+# pixels: tan(v_fov/2) ~= tan(h_fov/2) * (frame_height / frame_width). A
+# real spec-sheet number beats this approximation if you have one.
+VERTICAL_FOV_DEG = None
+
+
+def pixel_y_to_depression_angle(y, frame_height, vertical_fov_deg):
+    """Same pinhole-model idea as pixel_x_to_angle, but vertical: how far
+    BELOW the camera's own optical axis a pixel row sits, in degrees.
+    Positive = further down the image, which is the direction the ground
+    is in for a level or downward-tilted camera."""
+    half_height = frame_height / 2
+    half_fov_rad = math.radians(vertical_fov_deg / 2)
+    normalised_offset = (y - half_height) / half_height
+    return math.degrees(math.atan(normalised_offset * math.tan(half_fov_rad)))
+
+
+def ground_distance_from_bbox_bottom(y_bottom, frame_height,
+                                      camera_height_m=CAMERA_HEIGHT_M,
+                                      camera_tilt_deg=CAMERA_TILT_DEG,
+                                      vertical_fov_deg=VERTICAL_FOV_DEG):
+    """Distance ALONG THE GROUND from directly beneath the camera to an
+    object, estimated from the pixel row where its bounding box touches
+    the ground.
+
+    THE ONE ASSUMPTION THIS ENTIRELY DEPENDS ON: the object is actually
+    resting on the same flat ground plane the camera height is measured
+    from, and the bottom of its bounding box is genuinely where it
+    touches that ground (unoccluded, not floating). True for
+    victim/rubble/obstacle/ramp/door -- FALSE for wall markers, which sit
+    partway up a wall. Calling this on a marker's bbox produces a
+    confidently WRONG number (computed as if the marker were on the
+    floor), not a slightly noisy one -- do not call this for markers.
+
+    Geometry: the total angle below horizontal to the object's base is
+    the camera's own tilt PLUS how much further down the image the
+    object's base sits relative to the optical axis
+    (pixel_y_to_depression_angle). That angle, together with the known
+    camera height, forms a right triangle with the ground:
+        tan(depression_angle) = camera_height / distance
+    the same "angle of depression" relationship as the classic trig
+    problem, just with the angle read from a pixel row instead of a
+    protractor. If the camera is mounted perfectly level (tilt = 0), this
+    reduces to exactly the simple similar-triangles case.
+    """
+    if None in (camera_height_m, camera_tilt_deg, vertical_fov_deg):
+        raise ValueError(
+            "CAMERA_HEIGHT_M, CAMERA_TILT_DEG, and VERTICAL_FOV_DEG must be "
+            "measured on the real robot and set in camera_capture_v2_0.py "
+            "before this can return a trustworthy distance."
+        )
+
+    pixel_angle_deg = pixel_y_to_depression_angle(y_bottom, frame_height, vertical_fov_deg)
+    depression_angle_rad = math.radians(camera_tilt_deg + pixel_angle_deg)
+
+    if depression_angle_rad <= 0:
+        # The object's base sits AT OR ABOVE the horizon line in the
+        # image -- geometrically that's an infinite/undefined distance
+        # (or a sign this bbox shouldn't have been passed in here at
+        # all, e.g. it's actually a marker). Don't fabricate a number.
+        return None
+
+    return camera_height_m / math.tan(depression_angle_rad)
+# ---------------------------------------------------------------------------
+# --------------------------------------------
+
+# On some Pi camera / picamera2 builds, requesting "RGB888" actually returns
+# frames that are ALREADY in BGR order (a known library quirk) -- so applying
+# an RGB->BGR conversion on top of that swaps the channels a second time and
+# produces the wrong colours again. Confirmed by testing: hold a known pure
+# colour in front of the camera; if it displays as the "opposite" colour
+# (red<->blue swapped, yellow<->cyan swapped), the frames were already BGR
+# and this should be True. If colours display correctly with no conversion
+# at all, set this to False.
+PICAMERA_FRAME_ALREADY_BGR = False
+
+# ---- Motion-blur control -------------------------------------------------
+# A moving camera smears fine detail (marker symbol edges, ORB keypoints)
+# across pixels during the exposure window -- the fix is a SHORT exposure,
+# not a sharper lens. But a shorter exposure gathers less light, so the
+# image goes dark unless something else compensates -- AnalogueGain is
+# raised to make up for it below. This trades image NOISE for sharpness,
+# which is the right trade for detection (template matching and ORB
+# tolerate noise far better than they tolerate blur).
 #
-# This number is scene-dependent (a blank wall is "low variance" even
-# perfectly in focus) -- set it by printing the score on frames you know
-# are sharp vs. frames grabbed mid-pan at your actual driving speed, then
-# picking a threshold that separates them.
-BLUR_VARIANCE_THRESHOLD = 100.0
+# Start here and adjust by testing while actually moving the camera at
+# your real driving speed -- too short and frames get too dark/noisy even
+# after gain compensation; too long and blur creeps back in.
+MAX_EXPOSURE_TIME_US = 8000       # 8ms ceiling on exposure time
+MAX_ANALOGUE_GAIN = 8.0           # ceiling on how far gain compensates --
+                                   # sensor noise gets ugly well before most
+                                   # gain ranges max out, so this is a floor
+                                   # under image quality, not just a number
+
+# Frame duration limits (microseconds), min and max both set to the same
+# value below -- this is what actually pins the frame rate near a target,
+# rather than just requesting FRAME_SIZE and hoping the sensor picks a fast
+# enough rate on its own.
+TARGET_FPS = 60
+FRAME_DURATION_LIMIT_US = int(1_000_000 / TARGET_FPS)
+
+# IMPORTANT: changing exposure/gain changes overall brightness, which
+# shifts the Value channel of everything the colour detector sees. Any
+# time these constants change, re-run recalibrate_lighting.py (or a full
+# recalibrate) afterward -- the HSV bands calibrated at the OLD exposure
+# will be wrong at the new one.
 # --------------------------------------------
 
 
-class VisionSystem:
-    def __init__(self, profiles_file="profiles.pkl"):
-        self.colour_detector = ColourDetector(profiles_file)
-        self.marker_detector = MarkerDetector()
+class CameraCapture:
+    def __init__(self, use_picamera=None, frame_size=FRAME_SIZE):
+        # auto-detect unless explicitly told which camera to use
+        self.use_picamera = PICAMERA_AVAILABLE if use_picamera is None else use_picamera
 
-        self._ground_distance_configured = None not in (
-            CAMERA_HEIGHT_M, CAMERA_TILT_DEG, VERTICAL_FOV_DEG
-        )
-        if not self._ground_distance_configured:
-            print("[vision_system] CAMERA_HEIGHT_M / CAMERA_TILT_DEG / VERTICAL_FOV_DEG "
-                  "not set in camera_capture_v2_0.py -- 'distance_m' will be None on "
-                  "every detection until these are measured and configured.")
+        if self.use_picamera:
+            self._picam = Picamera2()
+            # requesting RGB888 explicitly -- picamera2's capture_array() then
+            # hands back an (H, W, 3) array in R, G, B channel order
+            config = self._picam.create_preview_configuration(
+                main={"format": "RGB888", "size": frame_size}
+            )
+            self._picam.configure(config)
+            self._picam.start()
 
-    # ---------------- Fusion ----------------
+            # Lock auto white balance and exposure once, right after start,
+            # instead of leaving them on "auto". If AWB is left free-running,
+            # the camera's colour cast can drift between the session you
+            # calibrated in and a later session (different lighting, or even
+            # just re-settling on startup) -- silently invalidating every
+            # HSV band calibrate.py learned. Locking it makes whatever colour
+            # cast exists repeatable, which is what the colour layer actually
+            # depends on -- not realistic-looking colour, just repeatable colour.
+            import time
+            time.sleep(1)  # let AWB/AEC settle on the current scene first
+            settled = self._picam.capture_metadata()
 
-    @staticmethod
-    def _blur_variance(frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        return cv2.Laplacian(gray, cv2.CV_64F).var()
-
-    def classify_frame(self, frame):
-        """Returns a list of detections, OR None if the frame was too
-        motion-blurred to trust. None is deliberately NOT the same as an
-        empty list: [] means "we looked carefully and found nothing
-        there", None means "we didn't get usable information this cycle
-        at all". Collapsing those into one signal would make a fast pan
-        look identical to a genuinely empty scene to anything consuming
-        this -- callers should hold their last known state on None, not
-        treat it as confirmation something disappeared.
-
-        Each detection carries "distance_m", the estimated ground-plane
-        distance to the object -- EXCEPT markers, which get None on
-        purpose (see ground_distance_from_bbox_bottom's docstring for why
-        a wall-mounted marker can't use this method)."""
-        if self._blur_variance(frame) < BLUR_VARIANCE_THRESHOLD:
-            return None
-
-        detections = []
-
-        # ---- colour, then shape resolves what colour alone can't ----
-        # These classes all rest on the floor, so ground-plane distance
-        # is valid for them.
-        candidates = self.colour_detector.detect(frame)
-        for cand, resolved in zip(candidates, resolve_candidates(candidates)):
-            was_ambiguous = len(cand["candidate_classes"]) > 1
-            detections.append({
-                "class": resolved["class"],
-                "bbox": resolved["bbox"],
-                "confidence": SHAPE_RESOLVED_CONFIDENCE if was_ambiguous else COLOUR_ONLY_CONFIDENCE,
-                "is_ground_object": True,
-            })
-
-        # ---- wall markers -- independent modality, merged in as-is ----
-        # NOT floor-level objects -- ground-plane distance does not apply.
-        for marker in self.marker_detector.detect(frame):
-            detections.append({
-                "class": marker.type,
-                "bbox": marker.bounding_box,
-                "confidence": marker.confidence,
-                "is_ground_object": False,
-            })
-
-        detections = self._suppress_overlaps(detections)
-        frame_width = frame.shape[1]
-        frame_height = frame.shape[0]
-        for d in detections:
-            x, y, w, h = d["bbox"]
-            centre_x = x + w / 2
-            d["angle_deg"] = pixel_x_to_angle(centre_x, frame_width)
-
-            if d["is_ground_object"] and self._ground_distance_configured:
-                y_bottom = y + h
-                d["distance_m"] = ground_distance_from_bbox_bottom(y_bottom, frame_height)
+            # Clamp exposure DOWN to the motion-blur ceiling, then raise
+            # gain to compensate for the light that shorter exposure no
+            # longer gathers -- keeps roughly the same overall brightness
+            # (and so the same HSV Value range) while cutting how much the
+            # frame smears during camera movement.
+            settled_exposure = settled["ExposureTime"]
+            exposure_time = min(settled_exposure, MAX_EXPOSURE_TIME_US)
+            if exposure_time < settled_exposure:
+                gain_scale = settled_exposure / exposure_time
+                analogue_gain = min(settled["AnalogueGain"] * gain_scale, MAX_ANALOGUE_GAIN)
             else:
-                d["distance_m"] = None
-        return detections
+                analogue_gain = settled["AnalogueGain"]
 
-    @staticmethod
-    def _iou(box_a, box_b):
-        """Intersection-over-union of two (x, y, w, h) boxes."""
-        ax1, ay1, aw, ah = box_a
-        bx1, by1, bw, bh = box_b
-        ax2, ay2 = ax1 + aw, ay1 + ah
-        bx2, by2 = bx1 + bw, by1 + bh
-
-        inter_x1, inter_y1 = max(ax1, bx1), max(ay1, by1)
-        inter_x2, inter_y2 = min(ax2, bx2), min(ay2, by2)
-        inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
-        if inter_area == 0:
-            return 0.0
-
-        union_area = aw * ah + bw * bh - inter_area
-        return inter_area / union_area
-
-    def _suppress_overlaps(self, detections):
-        """Same rule regardless of which layer(s) produced the overlapping
-        boxes: highest confidence first, discard anything that overlaps
-        something already kept."""
-        detections = sorted(detections, key=lambda d: d["confidence"], reverse=True)
-        kept = []
-        for d in detections:
-            if not any(self._iou(d["bbox"], k["bbox"]) > OVERLAP_IOU_THRESHOLD for k in kept):
-                kept.append(d)
-        return kept
-
-    # ---------------- Display ----------------
-
-    @staticmethod
-    def draw_detections(frame, detections):
-        for d in detections:
-            x, y, w, h = d["bbox"]
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            dist_str = f', {d["distance_m"]:.2f}m' if d["distance_m"] is not None else ''
-            label = f'{d["class"]} ({d["confidence"]:.0%}, {d["angle_deg"]:+.1f} deg{dist_str})'
-            cv2.putText(frame, label, (x, max(0, y - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-        if detections:
-            found_classes = sorted(set(d["class"] for d in detections))
-            status_text = f"True: {', '.join(found_classes)}"
-            status_colour = (0, 255, 0)
+            self._picam.set_controls({
+                "AwbEnable": False,
+                "ColourGains": settled["ColourGains"],
+                "AeEnable": False,
+                "ExposureTime": exposure_time,
+                "AnalogueGain": analogue_gain,
+                "FrameDurationLimits": (FRAME_DURATION_LIMIT_US, FRAME_DURATION_LIMIT_US),
+            })
+            print(f"[camera] using picamera2 -- PICAMERA_FRAME_ALREADY_BGR = {PICAMERA_FRAME_ALREADY_BGR}, "
+                  f"exposure={exposure_time}us (was {settled_exposure}us), "
+                  f"gain={analogue_gain:.2f} (was {settled['AnalogueGain']:.2f}), "
+                  f"target {TARGET_FPS}fps -- re-run recalibrate_lighting.py after "
+                  f"changing MAX_EXPOSURE_TIME_US")
         else:
-            status_text = "False"
-            status_colour = (0, 0, 255)
+            self._cap = cv2.VideoCapture(USB_CAMERA_INDEX)
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, frame_size[0])
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, frame_size[1])
+            self._cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
+            # Best-effort only -- UVC webcam exposure control via
+            # cv2.VideoCapture is inconsistent across hardware/drivers,
+            # unlike picamera2's reliable ExposureTime/AnalogueGain above.
+            # 0.25 here means "manual mode" on most UVC-standard cameras,
+            # but some ignore it entirely -- check with a printed frame
+            # timestamp/blur-variance test on YOUR specific webcam rather
+            # than trusting this blindly.
+            self._cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+            self._cap.set(cv2.CAP_PROP_EXPOSURE, -6)  # roughly "short", scale is driver-specific
+            if not self._cap.isOpened():
+                raise RuntimeError(f"Could not open USB camera index {USB_CAMERA_INDEX}")
+            print("[camera] using USB webcam via cv2.VideoCapture -- exposure control is "
+                  "best-effort here, verify it actually took effect on your hardware")
 
-        (text_w, text_h), _ = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-        frame_h, frame_w = frame.shape[:2]
-        x_pos = frame_w - text_w - 10
-        y_pos = text_h + 15
-        cv2.putText(frame, status_text, (x_pos, y_pos),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_colour, 2)
-
-        return frame
-
-
-def run_live(vision_system):
-    camera = CameraCapture()
-    last_detections = []  # most recent GENUINE result -- survives blurry frames
-
-    while True:
-        frame = camera.read()
-        if frame is None:
-            break
-
-        detections = vision_system.classify_frame(frame)
-        if detections is None:
-            # Blurred frame -- no new information this cycle, not
-            # confirmation the scene is empty. Keep showing the last
-            # genuine result instead of flashing to "nothing detected",
-            # and log it distinctly so it's obvious which frames were
-            # actually skipped versus genuinely empty.
-            print("[blurry frame skipped]")
-            display = vision_system.draw_detections(frame, last_detections)
-            cv2.putText(display, "BLURRY -- showing last known state", (10, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+    def read(self):
+        """Returns one frame in BGR order (what OpenCV expects), or None on failure."""
+        if self.use_picamera:
+            frame = self._picam.capture_array()
+            if PICAMERA_FRAME_ALREADY_BGR:
+                return frame  # already correct order -- converting again would swap it back to wrong
+            return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         else:
-            last_detections = detections
-            if detections:
-                print([(d["class"], f'{d["confidence"]:.2f}', f'{d["angle_deg"]:+.1f} deg') for d in detections])
-            display = vision_system.draw_detections(frame, detections)
+            ok, frame_bgr = self._cap.read()  # cv2.VideoCapture already returns BGR
+            return frame_bgr if ok else None
 
-        cv2.imshow("Vision System (colour + shape + marker)", display)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    camera.release()
-    cv2.destroyAllWindows()
-
-
-if __name__ == "__main__":
-    vs = VisionSystem()
-    run_live(vs)
+    def release(self):
+        if self.use_picamera:
+            self._picam.stop()
+        else:
+            self._cap.release()
