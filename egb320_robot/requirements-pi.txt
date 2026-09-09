@@ -6,4 +6,4 @@ lgpio                  # gpiozero backend for Pi 5 (RP1 I/O chip)
 opencv-python-headless # Kushal's vision module (cv2)
 picamera2              # Pi Camera Module 3 (usually installed via apt on Pi OS)
 # DFRobot motor HAT library is not on PyPI — clone it into egb320/mobility/vendor/:
-#   git clone https://github.com/DFRobot/DFRobot_RaspberryPi_Motor
+#   git clone https://github.com/DFRobot/DFRobot_RaspberryPi_Motor egb320/mobility/vendor

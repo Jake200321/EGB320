@@ -20,6 +20,7 @@ Call `set_velocity()` every tick (the nav loop already does, at 20 Hz).
 from __future__ import annotations
 
 import math
+import shlex
 import sys
 import threading
 import time
@@ -56,7 +57,10 @@ def load_board_class():
     except ImportError as exc:
         raise ImportError(
             "DFRobot motor HAT library not found. It is not on PyPI -- clone it:\n"
-            f"    git clone https://github.com/DFRobot/DFRobot_RaspberryPi_Motor {VENDOR_DIR}"
+            "    git clone https://github.com/DFRobot/DFRobot_RaspberryPi_Motor "
+            f"{shlex.quote(str(VENDOR_DIR))}\n"
+            "(the space before the destination is meant to be there -- "
+            "git clone takes <url> then <destination>)"
         ) from exc
 
 
