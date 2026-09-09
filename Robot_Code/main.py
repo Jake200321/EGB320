@@ -197,7 +197,31 @@ def status_text(nav, sonar, leds, hz):
 
     lit = "".join(c if getattr(leds, "_state", {}).get(n) else "-"
                   for n, c in (("green", "G"), ("yellow", "Y"), ("red", "R")))
-    return f"{state:<19}| {target:<38}| {sonar_txt} | {lit} | {hz:4.1f}Hz"
+    return (f"{state:<19}| {target:<38}| {vision_summary(getattr(nav, 'vision', None))}"
+            f" | {sonar_txt} | {lit} | {hz:4.1f}Hz")
+
+
+def vision_summary(vision):
+    """What vision did with the last frame -- the thing that was invisible before.
+
+    A frame rejected by the blur guard produced no boxes and no message, which looks
+    exactly like "nothing is there". It now says so, with the number it was judged on.
+    """
+    if vision is None:
+        return "vis: --"
+    if getattr(vision, "blur_rejected", False):
+        blur = getattr(vision, "last_blur", None)
+        thr = getattr(vision, "blur_threshold", None)
+        return (f"vis: BLUR-REJECT {blur:.0f}<{thr:.0f}" if blur is not None and thr
+                else "vis: BLUR-REJECT")
+    counts = getattr(vision, "class_counts", {}) or {}
+    blobs = ("none" if not counts else
+             " ".join(f"{k}x{v}" for k, v in sorted(counts.items())))
+    raw = getattr(vision, "n_victim_raw", 0)
+    kept = getattr(vision, "n_victim_kept", 0)
+    blur = getattr(vision, "last_blur", None)
+    blur_txt = "" if blur is None else f" blur{blur:.0f}"
+    return f"vis:{blur_txt} [{blobs}] victim {kept}/{raw}"
 
 
 class Display:
@@ -290,6 +314,25 @@ def render_hud(frame, detections, nav, sonar, draw_detections=None):
         cv2.line(img, (cx, y), (cx, y + bh), (0, 220, 255), 1)
         cv2.circle(img, (w // 2, h - 30), 4, (255, 255, 255), -1)
         cv2.line(img, (w // 2, h - 30), (cx, y + bh), (0, 220, 255), 1)
+
+    # --- vision diagnostics, second row ---
+    vision = getattr(nav, "vision", None)
+    if vision is not None:
+        if getattr(vision, "blur_rejected", False):
+            b, t = getattr(vision, "last_blur", None), getattr(vision, "blur_threshold", None)
+            msg = (f"FRAME REJECTED: blur {b:.0f} < threshold {t:.0f}"
+                   if b is not None and t else "FRAME REJECTED (blur guard)")
+            cv2.rectangle(img, (0, 30), (w, 56), (0, 0, 90), -1)
+            cv2.putText(img, msg + "  -- try --blur-threshold 0", (8, 49),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 120, 255), 2)
+        else:
+            counts = getattr(vision, "class_counts", {}) or {}
+            txt = ("blobs: none" if not counts else
+                   "blobs: " + "  ".join(f"{k} x{v}" for k, v in sorted(counts.items())))
+            txt += f"   victim kept {getattr(vision,'n_victim_kept',0)}" \
+                   f"/{getattr(vision,'n_victim_raw',0)}"
+            cv2.putText(img, txt, (8, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (220, 220, 220), 1)
 
     # --- sonar readout along the bottom ---
     cv2.rectangle(img, (0, h - 26), (w, h), (0, 0, 0), -1)
@@ -620,6 +663,13 @@ class VictimVision:
         self.last_frame = None
         self.last_detections = []
         self.draw_detections = None
+        # diagnostics, so a frame going nowhere is visible instead of silent
+        self.last_blur = None
+        self.blur_rejected = False
+        self.blur_threshold = None
+        self.class_counts = {}
+        self.n_victim_raw = 0
+        self.n_victim_kept = 0
 
         if use_placeholder:
             print("[vision] PLACEHOLDER detector -- not the real vision system")
@@ -638,6 +688,8 @@ class VictimVision:
         finally:
             os.chdir(cwd)
         self.draw_detections = type(self.system).draw_detections
+        import vision_system_v2_0 as _vs
+        self.blur_threshold = _vs.BLUR_VARIANCE_THRESHOLD
         print(f"[vision] VisionSystem, filtering for {VICTIM_CLASS_NAME!r}"
               f"{' on the floor' if VICTIM_ON_FLOOR else ''}")
 
@@ -665,13 +717,30 @@ class VictimVision:
             dets = [{"class": VICTIM_CLASS_NAME, "bbox": b, "is_ground_object": True,
                      "angle_deg": self._angle(b), "distance_m": None} for b in boxes]
         else:
+            # Measure the same thing classify_frame gates on, so a rejection can be
+            # reported with its number rather than silently dropping the frame.
+            try:
+                self.last_blur = float(self.system._blur_variance(frame))
+            except Exception:                  # noqa: BLE001
+                self.last_blur = None
             dets = self.system.classify_frame(frame)
             if dets is None:
+                self.blur_rejected = True
                 self.last_detections = []
+                self.class_counts = {}
+                self.n_victim_raw = self.n_victim_kept = 0
                 return UNUSABLE                # too blurred to conclude anything
+            self.blur_rejected = False
 
         self.last_detections = dets
-        victims = [d for d in dets if self._is_target(d)]
+        counts = {}
+        for d in dets:
+            counts[d.get("class", "?")] = counts.get(d.get("class", "?"), 0) + 1
+        self.class_counts = counts
+
+        raw = [d for d in dets if d.get("class") == VICTIM_CLASS_NAME]
+        victims = [d for d in raw if self._is_target(d)]
+        self.n_victim_raw, self.n_victim_kept = len(raw), len(victims)
         if not victims:
             return None
 
@@ -864,6 +933,12 @@ def main():
                     help="stand-in HSV detector instead of the real one")
     ap.add_argument("--no-display", action="store_true",
                     help="don't open the camera window (headless / over SSH)")
+    ap.add_argument("--blur-threshold", type=float, default=None,
+                    help="override VisionSystem's blur guard; 0 disables it entirely. "
+                         "Frames below it are discarded whole, which looks identical "
+                         "to an empty scene")
+    ap.add_argument("--vision-debug", action="store_true",
+                    help="print a line per frame: blur, blobs by class, victims kept")
     ap.add_argument("--no-status", action="store_true",
                     help="don't print the live status line")
     ap.add_argument("--check", action="store_true", help="wire up, report, exit")
@@ -893,7 +968,15 @@ def main():
     leds = Leds()
     drive = Drive(enabled=not args.no_motors)
     sonar = Ultrasonics(enabled=not args.no_sonar)
+    if args.blur_threshold is not None:
+        import vision_system_v2_0 as _vs
+        STATUS.event(f"[vision] blur guard {_vs.BLUR_VARIANCE_THRESHOLD} -> "
+                     f"{args.blur_threshold}"
+                     f"{' (disabled)' if args.blur_threshold <= 0 else ''}")
+        _vs.BLUR_VARIANCE_THRESHOLD = args.blur_threshold
     vision = VictimVision(use_placeholder=args.placeholder_vision)
+    if args.blur_threshold is not None:
+        vision.blur_threshold = args.blur_threshold
     nav = Nav(drive, vision, leds, sonar)
     display = Display(enabled=not args.no_display)
 
@@ -931,6 +1014,8 @@ def main():
                 STATUS.event("[display] quit requested")
                 break
 
+            if args.vision_debug:
+                STATUS.event(f"[vision] {vision_summary(vision)}")
             STATUS.update(status_text(nav, sonar, leds, hz))
             elapsed = time.monotonic() - t0
             time.sleep(max(0.0, period - elapsed))

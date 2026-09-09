@@ -229,5 +229,49 @@ check("...and update() is a no-op", _son.get("front") is None)
 _st = M.status_text(M.Nav(FakeDrive(), FakeVision([]), _leds, _son), _son, _leds, 20.0)
 check("status_text renders", "EXPLORING" in _st and "sonar" in _st)
 
+print("17) a frame that goes nowhere says so instead of looking empty")
+# The blur guard in VisionSystem.classify_frame discards a whole frame, which used to
+# produce no boxes and no message -- indistinguishable from "nothing is there". That
+# cost real bench time, so the three outcomes must now be told apart in the summary.
+try:
+    import numpy as np
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "vision"))
+    import camera_capture_v2_0 as _cc
+
+    _frames = []
+    class _FakeCam:
+        def __init__(self, *a, **k): pass
+        def read(self): return _frames.pop(0) if _frames else None
+        def release(self): pass
+    _cc.CameraCapture = _FakeCam
+
+    _cwd = os.getcwd()
+    _vision = M.VictimVision()
+    os.chdir(_cwd)
+    _rng = np.random.default_rng(2)
+
+    _flat = np.full((480, 640, 3), 70, np.uint8)                  # no texture -> rejected
+    _cyan = _rng.integers(45, 95, (480, 640, 3), dtype=np.uint8)
+    _cyan[320:390, 250:390] = (255, 255, 0)                       # BGR cyan on the floor
+    _empty = _rng.integers(45, 95, (480, 640, 3), dtype=np.uint8)
+
+    _frames.append(_flat)
+    check("blurred frame returns UNUSABLE", _vision.look() is M.UNUSABLE)
+    check("...and is reported as a rejection", "BLUR-REJECT" in M.vision_summary(_vision))
+
+    _frames.append(_cyan)
+    _r = _vision.look()
+    check("cyan object on the floor is a victim", isinstance(_r, M.Victim))
+    check("...and the summary counts it", "victim 1/1" in M.vision_summary(_vision))
+
+    _frames.append(_empty)
+    check("textured but empty frame returns None", _vision.look() is None)
+    _sum = M.vision_summary(_vision)
+    check("...reported as empty, NOT as a rejection",
+          "none" in _sum and "BLUR-REJECT" not in _sum)
+except ImportError as _e:
+    print(f"  SKIP  needs numpy + opencv + the vision package ({_e})")
+
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)
