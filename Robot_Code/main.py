@@ -87,13 +87,21 @@ LOST_GRACE_FRAMES = 8       # frames a victim may vanish for before we call it l
 YELLOW_FLASH_HZ = 2.0
 CONTROL_HZ = 20
 
-# --- camera ranging: OPTIONAL now, the front sonar is the primary estimator ----
-# Fill these in and the camera becomes a cross-check and a fallback for when the
-# victim is off to one side, where the sonar cone can't be trusted to be seeing it.
-# Nothing here can be guessed -- a wrong value gives a confidently wrong distance.
-CAMERA_HEIGHT_M = None      # lens centre height above the floor, metres
-CAMERA_TILT_DEG = None      # degrees below horizontal (0.0 if mounted level)
-VERTICAL_FOV_DEG = None     # Camera Module 3 -- use the VERTICAL spec figure
+# --- camera ranging: measured on the robot 2026-09-09 -------------------------
+# The front sonar is still the primary estimator; these make the camera a usable
+# fallback for when the victim is off to one side, outside the sonar's cone.
+CAMERA_HEIGHT_M = 0.10      # lens centre above the floor
+CAMERA_TILT_DEG = 0.0       # mounted level
+VERTICAL_FOV_DEG = 41.0     # Camera Module 3 standard lens
+
+# Bearing FOV. NOTE: vision/camera_capture_v2_0.py defaults to 45.0, which does not
+# match a 41 deg vertical -- the Camera Module 3 standard lens is 66 x 41, and 45 x 41
+# is not a real 4:3 lens. A too-small FOV understates every bearing (a victim 15 deg
+# off-axis reads as ~10), which both slows the steering correction and lets the
+# US_TRUST_BEARING_DEG gate believe the sonar when the victim is further off-axis than
+# it thinks. Nav passes this explicitly rather than taking that default; Kushal's file
+# still needs fixing at source.
+HORIZONTAL_FOV_DEG = 66.0
 
 # Placeholder detector only (--placeholder-vision). NOT Kushal's calibrated bands.
 # Taken from the victim entry in profiles.pkl (hue 78-102, green-cyan) so the
@@ -451,7 +459,8 @@ class VictimVision:
         # Largest box = nearest victim. Good enough while only one is in frame;
         # revisit if the demo ever has two at once.
         x, y, w, h = max(boxes, key=lambda b: b[2] * b[3])
-        bearing = self._pixel_x_to_angle(x + w / 2.0, self.frame_w)
+        bearing = self._pixel_x_to_angle(x + w / 2.0, self.frame_w,
+                                         fov_deg=HORIZONTAL_FOV_DEG)
 
         distance = None
         if self.geometry_ok:
