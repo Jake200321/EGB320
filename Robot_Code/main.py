@@ -10,6 +10,7 @@
     python3 main.py --no-display         # headless / over SSH with no X
     python3 main.py --placeholder-vision # use the stand-in detector, NOT Kushal's
     python3 main.py --check              # wire everything up, report, exit
+    python3 main.py --blur-threshold 100 # put Kushal's blur guard back on
     python3 main.py --sonar-test         # just the three ranges, live
 
 While it runs you get three views of what it's doing:
@@ -73,6 +74,14 @@ US_STALE_AFTER_S = 0.5      # a reading older than this is discarded, not reused
 US_TRUST_BEARING_DEG = 10.0 # only believe the front sonar is ranging the VICTIM
                             # when the victim is this close to centre -- the cone
                             # is ~15 deg and it reports whatever is nearest in it
+
+# VisionSystem discards any frame whose Laplacian variance falls under this, which
+# on the real camera -- 8 ms exposure, high gain, ordinary room light -- threw away
+# effectively every frame and made victim detection impossible from main.py.
+# 0 disables the guard entirely, which is what the robot actually runs with.
+# --blur-threshold overrides it (100.0 is Kushal's original) if motion blur ever
+# becomes the bigger problem.
+BLUR_THRESHOLD = 0.0
 
 VICTIM_CLASS_NAME = "victim"   # matches the profiles.pkl classes: obstacle/ramp/rubble/victim
 
@@ -315,24 +324,16 @@ def render_hud(frame, detections, nav, sonar, draw_detections=None):
         cv2.circle(img, (w // 2, h - 30), 4, (255, 255, 255), -1)
         cv2.line(img, (w // 2, h - 30), (cx, y + bh), (0, 220, 255), 1)
 
-    # --- vision diagnostics, second row ---
+    # --- what vision found, second row ---
     vision = getattr(nav, "vision", None)
     if vision is not None:
-        if getattr(vision, "blur_rejected", False):
-            b, t = getattr(vision, "last_blur", None), getattr(vision, "blur_threshold", None)
-            msg = (f"FRAME REJECTED: blur {b:.0f} < threshold {t:.0f}"
-                   if b is not None and t else "FRAME REJECTED (blur guard)")
-            cv2.rectangle(img, (0, 30), (w, 56), (0, 0, 90), -1)
-            cv2.putText(img, msg + "  -- try --blur-threshold 0", (8, 49),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (120, 120, 255), 2)
-        else:
-            counts = getattr(vision, "class_counts", {}) or {}
-            txt = ("blobs: none" if not counts else
-                   "blobs: " + "  ".join(f"{k} x{v}" for k, v in sorted(counts.items())))
-            txt += f"   victim kept {getattr(vision,'n_victim_kept',0)}" \
-                   f"/{getattr(vision,'n_victim_raw',0)}"
-            cv2.putText(img, txt, (8, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                        (220, 220, 220), 1)
+        counts = getattr(vision, "class_counts", {}) or {}
+        txt = ("blobs: none" if not counts else
+               "blobs: " + "  ".join(f"{k} x{v}" for k, v in sorted(counts.items())))
+        txt += f"   victim kept {getattr(vision,'n_victim_kept',0)}" \
+               f"/{getattr(vision,'n_victim_raw',0)}"
+        cv2.putText(img, txt, (8, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    (220, 220, 220), 1)
 
     # --- sonar readout along the bottom ---
     cv2.rectangle(img, (0, h - 26), (w, h), (0, 0, 0), -1)
@@ -934,9 +935,8 @@ def main():
     ap.add_argument("--no-display", action="store_true",
                     help="don't open the camera window (headless / over SSH)")
     ap.add_argument("--blur-threshold", type=float, default=None,
-                    help="override VisionSystem's blur guard; 0 disables it entirely. "
-                         "Frames below it are discarded whole, which looks identical "
-                         "to an empty scene")
+                    help=f"override the blur guard (default {BLUR_THRESHOLD:g} = off). "
+                         "Frames scoring below it are discarded whole")
     ap.add_argument("--vision-debug", action="store_true",
                     help="print a line per frame: blur, blobs by class, victims kept")
     ap.add_argument("--no-status", action="store_true",
@@ -968,15 +968,15 @@ def main():
     leds = Leds()
     drive = Drive(enabled=not args.no_motors)
     sonar = Ultrasonics(enabled=not args.no_sonar)
-    if args.blur_threshold is not None:
+    blur = BLUR_THRESHOLD if args.blur_threshold is None else args.blur_threshold
+    if not args.placeholder_vision:
         import vision_system_v2_0 as _vs
-        STATUS.event(f"[vision] blur guard {_vs.BLUR_VARIANCE_THRESHOLD} -> "
-                     f"{args.blur_threshold}"
-                     f"{' (disabled)' if args.blur_threshold <= 0 else ''}")
-        _vs.BLUR_VARIANCE_THRESHOLD = args.blur_threshold
+        if _vs.BLUR_VARIANCE_THRESHOLD != blur:
+            STATUS.event(f"[vision] blur guard {_vs.BLUR_VARIANCE_THRESHOLD:g} -> {blur:g}"
+                         f"{' (off)' if blur <= 0 else ''}")
+        _vs.BLUR_VARIANCE_THRESHOLD = blur
     vision = VictimVision(use_placeholder=args.placeholder_vision)
-    if args.blur_threshold is not None:
-        vision.blur_threshold = args.blur_threshold
+    vision.blur_threshold = blur
     nav = Nav(drive, vision, leds, sonar)
     display = Display(enabled=not args.no_display)
 

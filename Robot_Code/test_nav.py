@@ -273,5 +273,21 @@ try:
 except ImportError as _e:
     print(f"  SKIP  needs numpy + opencv + the vision package ({_e})")
 
+print("18) the blur guard is OFF by default, so a dim frame still detects")
+# This was a flag you had to remember to pass, and forgetting it meant no victim
+# detection at all from main.py. It's now the default; this locks that in.
+check("BLUR_THRESHOLD defaults to off", M.BLUR_THRESHOLD == 0.0)
+try:
+    import numpy as np
+    import vision_system_v2_0 as _vsmod
+    _vsmod.BLUR_VARIANCE_THRESHOLD = M.BLUR_THRESHOLD
+    _frames.append(np.full((480, 640, 3), 70, np.uint8))
+    _frames[-1][300:390, 250:390] = (255, 255, 0)     # turquoise, low-texture scene
+    _v2 = M.VictimVision(); os.chdir(_cwd)
+    _r2 = _v2.look()
+    check("dim low-texture frame still yields a victim", isinstance(_r2, M.Victim))
+except (ImportError, NameError) as _e:
+    print(f"  SKIP  needs numpy + opencv ({_e})")
+
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)
