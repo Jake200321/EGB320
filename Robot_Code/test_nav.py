@@ -25,10 +25,11 @@ class FakeDrive:
 
 
 class FakeLeds:
-    def __init__(self): self.g = None; self.y = None; self.ylog = []
+    def __init__(self): self.g = None; self.y = None; self.r = None; self.ylog = []
     def green(self, on): self.g = on
     def yellow(self, on): self.y = on; self.ylog.append(on)
-    def all_off(self): self.g = self.y = False
+    def red(self, on): self.r = on
+    def all_off(self): self.g = self.y = self.r = False
 
 
 class FakeVision:

@@ -36,8 +36,9 @@ for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "vision")):
 # CONFIG -- the only numbers you should need to touch
 # ===========================================================================
 
-GREEN_LED_BCM = 17          # victim detected
-YELLOW_LED_BCM = 27         # collection placeholder
+GREEN_LED_BCM = 16          # victim detected
+YELLOW_LED_BCM = 20         # collection placeholder
+RED_LED_BCM = 21            # returning to base -- wired, not yet driven by the FSM
 
 # Ultrasonics: (TRIG_BCM, ECHO_BCM). Front is the primary range to the victim;
 # left/right are for walls. All reachable through the HAT's passthrough pins.
@@ -45,10 +46,15 @@ YELLOW_LED_BCM = 27         # collection placeholder
 # *** ECHO IS A 5 V OUTPUT AND PI GPIO IS 3.3 V ONLY ***
 # Wire each ECHO through a divider (1k in series, 2k to ground) or you will
 # eventually damage the pin. TRIG is an input to the sensor and is fine direct.
+# Right was on (20, 21) until the LEDs claimed those; moved to (22, 27).
+# Full pin map -- keep these disjoint:
+#   I2C to the motor HAT   2, 3
+#   LEDs                   16 green, 20 yellow, 21 red
+#   ultrasonics            23/24 front, 5/6 left, 22/27 right
 ULTRASONIC_PINS = {
     "front": (23, 24),
     "left":  (5, 6),
-    "right": (20, 21),
+    "right": (22, 27),
 }
 US_MAX_RANGE_M = 2.0        # ignore anything past this -- beyond the maze anyway
 US_MIN_TRIGGER_GAP_S = 0.06 # HC-SR04 wants >60 ms between pings; sensors are fired
@@ -125,17 +131,19 @@ class Leds:
     claimed, so the nav logic stays testable on a laptop.
     """
 
-    def __init__(self, green_pin=GREEN_LED_BCM, yellow_pin=YELLOW_LED_BCM):
+    def __init__(self, green_pin=GREEN_LED_BCM, yellow_pin=YELLOW_LED_BCM,
+                 red_pin=RED_LED_BCM):
         self.real = False
         try:
             from gpiozero import LED
             self._green = LED(green_pin)
             self._yellow = LED(yellow_pin)
+            self._red = LED(red_pin)
             self.real = True
-            print(f"[leds] GPIO {green_pin} (green), {yellow_pin} (yellow)")
+            print(f"[leds] GPIO {green_pin} green, {yellow_pin} yellow, {red_pin} red")
         except Exception as exc:                       # noqa: BLE001
             print(f"[leds] CONSOLE ONLY -- {type(exc).__name__}: {exc}")
-        self._state = {"green": None, "yellow": None}
+        self._state = {"green": None, "yellow": None, "red": None}
 
     def _set(self, name, obj, on):
         if self._state[name] == on:
@@ -152,10 +160,16 @@ class Leds:
     def yellow(self, on):
         self._set("yellow", getattr(self, "_yellow", None), on)
 
+    def red(self, on):
+        # Wired and driveable, but nothing sets it yet -- there's no return-to-base
+        # state in the FSM. Left here so that behaviour has somewhere to land.
+        self._set("red", getattr(self, "_red", None), on)
+
     def all_off(self):
         try:
             self.green(False)
             self.yellow(False)
+            self.red(False)
         except Exception:                              # noqa: BLE001
             pass
 
@@ -545,6 +559,7 @@ class Nav:
         if state == SEARCH:
             self.leds.green(False)
             self.leds.yellow(False)
+            self.leds.red(False)
 
     @property
     def can_range(self):
