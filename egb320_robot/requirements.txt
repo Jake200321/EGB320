@@ -1,4 +1,0 @@
-# Works on the laptop (sim / mock / tests). Hardware-only deps live in requirements-pi.txt.
-numpy
-pytest
-coppeliasim-zmqremoteapi-client   # only needed for --backend sim
