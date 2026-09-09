@@ -46,6 +46,84 @@ def pixel_x_to_angle(x, frame_width, fov_deg=HORIZONTAL_FOV_DEG):
     half_fov_rad = math.radians(fov_deg / 2)
     normalised_offset = (x - half_width) / half_width  # -1 .. +1 across the frame
     return math.degrees(math.atan(normalised_offset * math.tan(half_fov_rad)))
+
+
+# ---- Ground-plane distance estimation ------------------------------------
+# Requires three physical values that CANNOT be safely guessed -- get any
+# of these wrong and every distance is silently, confidently wrong (not
+# just a bit noisy), which is worse for navigation than having no distance
+# at all. Measure them on the real robot and set them here before trusting
+# any output from ground_distance_from_bbox_bottom.
+CAMERA_HEIGHT_M = None    # camera's height above the floor, in metres
+CAMERA_TILT_DEG = None    # how far the camera points DOWN from level --
+                           # 0.0 if mounted perfectly horizontal
+
+# A SEPARATE number from HORIZONTAL_FOV_DEG -- don't assume a lens is
+# symmetric. If your camera's spec only gives a horizontal figure, this
+# approximates the vertical one for a simple rectilinear lens with square
+# pixels: tan(v_fov/2) ~= tan(h_fov/2) * (frame_height / frame_width). A
+# real spec-sheet number beats this approximation if you have one.
+VERTICAL_FOV_DEG = None
+
+
+def pixel_y_to_depression_angle(y, frame_height, vertical_fov_deg):
+    """Same pinhole-model idea as pixel_x_to_angle, but vertical: how far
+    BELOW the camera's own optical axis a pixel row sits, in degrees.
+    Positive = further down the image, which is the direction the ground
+    is in for a level or downward-tilted camera."""
+    half_height = frame_height / 2
+    half_fov_rad = math.radians(vertical_fov_deg / 2)
+    normalised_offset = (y - half_height) / half_height
+    return math.degrees(math.atan(normalised_offset * math.tan(half_fov_rad)))
+
+
+def ground_distance_from_bbox_bottom(y_bottom, frame_height,
+                                      camera_height_m=CAMERA_HEIGHT_M,
+                                      camera_tilt_deg=CAMERA_TILT_DEG,
+                                      vertical_fov_deg=VERTICAL_FOV_DEG):
+    """Distance ALONG THE GROUND from directly beneath the camera to an
+    object, estimated from the pixel row where its bounding box touches
+    the ground.
+
+    THE ONE ASSUMPTION THIS ENTIRELY DEPENDS ON: the object is actually
+    resting on the same flat ground plane the camera height is measured
+    from, and the bottom of its bounding box is genuinely where it
+    touches that ground (unoccluded, not floating). True for
+    victim/rubble/obstacle/ramp/door -- FALSE for wall markers, which sit
+    partway up a wall. Calling this on a marker's bbox produces a
+    confidently WRONG number (computed as if the marker were on the
+    floor), not a slightly noisy one -- do not call this for markers.
+
+    Geometry: the total angle below horizontal to the object's base is
+    the camera's own tilt PLUS how much further down the image the
+    object's base sits relative to the optical axis
+    (pixel_y_to_depression_angle). That angle, together with the known
+    camera height, forms a right triangle with the ground:
+        tan(depression_angle) = camera_height / distance
+    the same "angle of depression" relationship as the classic trig
+    problem, just with the angle read from a pixel row instead of a
+    protractor. If the camera is mounted perfectly level (tilt = 0), this
+    reduces to exactly the simple similar-triangles case.
+    """
+    if None in (camera_height_m, camera_tilt_deg, vertical_fov_deg):
+        raise ValueError(
+            "CAMERA_HEIGHT_M, CAMERA_TILT_DEG, and VERTICAL_FOV_DEG must be "
+            "measured on the real robot and set in camera_capture_v2_0.py "
+            "before this can return a trustworthy distance."
+        )
+
+    pixel_angle_deg = pixel_y_to_depression_angle(y_bottom, frame_height, vertical_fov_deg)
+    depression_angle_rad = math.radians(camera_tilt_deg + pixel_angle_deg)
+
+    if depression_angle_rad <= 0:
+        # The object's base sits AT OR ABOVE the horizon line in the
+        # image -- geometrically that's an infinite/undefined distance
+        # (or a sign this bbox shouldn't have been passed in here at
+        # all, e.g. it's actually a marker). Don't fabricate a number.
+        return None
+
+    return camera_height_m / math.tan(depression_angle_rad)
+# ---------------------------------------------------------------------------
 # --------------------------------------------
 
 # On some Pi camera / picamera2 builds, requesting "RGB888" actually returns
