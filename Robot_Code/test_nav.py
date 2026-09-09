@@ -178,5 +178,24 @@ n.step()
 check("stops closing", d.last[0] == 0.0)
 check("stays in APPROACH", n.state == M.APPROACH)
 
+print("13) a blurred frame is not the victim disappearing")
+# classify_frame() returns None on a motion-blurred frame, which is NOT an empty
+# result. Nav must hold what it knows rather than counting it as a miss -- otherwise
+# a fast pan looks identical to the victim vanishing.
+d, l, son = FakeDrive(), FakeLeds(), FakeSonar(front=0.50)
+n = M.Nav(d, FakeVision([V()] * 3 + [M.UNUSABLE] * 60), l, son)
+run(n, 4)
+check("approaching before the blur", n.state == M.APPROACH)
+run(n, 30)                                  # far more than LOST_GRACE_FRAMES
+check("still APPROACH through a long blur", n.state == M.APPROACH)
+check("green still on", l.g is True)
+check("misses not counted", n.misses == 0)
+
+print("14) a genuinely empty frame still loses the victim")
+d, l = FakeDrive(), FakeLeds()
+n = M.Nav(d, FakeVision([V()] * 3 + [None] * 12), l, FakeSonar(front=0.50))
+run(n, 15)
+check("empty frames DO drop to SEARCH", n.state == M.SEARCH)
+
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)

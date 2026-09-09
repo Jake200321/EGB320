@@ -27,7 +27,8 @@ import time
 # class_profile_v2_0 as top-level modules, which live in vision/. Put both on the
 # path so they resolve either way.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "vision")):
+_VISION_DIR = os.path.join(_REPO_ROOT, "vision")
+for _p in (_REPO_ROOT, _VISION_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -407,121 +408,104 @@ class Victim:
         return f"<Victim {self.bearing_deg:+.1f}deg {d} area={self.area_px}>"
 
 
-class VictimVision:
-    """Camera + victim detector.
+UNUSABLE = object()     # frame carried no usable information (blurred, or no frame)
 
-    Uses Kushal's ColourDetector, keeping only candidates labelled VICTIM_CLASS_NAME.
-    Nav does the rest itself -- bearing via pixel_x_to_angle, range via
-    ground_distance_from_bbox_bottom -- so the detector needs no knowledge of nav.
+
+class VictimVision:
+    """Kushal's VisionSystem, narrowed to the one thing nav needs: the victim object.
+
+    Two things about classify_frame() that nav has to respect:
+
+    * It returns None when the frame is too motion-blurred to trust, which is
+      deliberately NOT an empty list. Empty means "looked, nothing there"; None means
+      "no information this cycle". Collapsing them would make a fast pan look exactly
+      like the victim vanishing. look() passes that through as UNUSABLE.
+
+    * Its is_ground_object flag means "a colour detection rather than a marker-template
+      one" -- so the wall MARKER, which shares the victim's colour, comes back as
+      is_ground_object=True too. Verified: a frame with the victim on the floor and the
+      same image up a wall yields two detections, both class=victim, both ground=True.
+      So we gate on geometry as well, via is_on_floor().
     """
 
     def __init__(self, use_placeholder=False):
-        from vision.vision_system_v2_0 import CameraCapture, pixel_x_to_angle
-        self._pixel_x_to_angle = pixel_x_to_angle
+        from camera_capture_v2_0 import (CAMERA_HEIGHT_M as CH, CAMERA_TILT_DEG as CT,
+                                         VERTICAL_FOV_DEG as VF, CameraCapture)
         self.camera = CameraCapture()
         self.frame_w = self.frame_h = None
+        self.geometry_ok = None not in (CH, CT, VF)
+        self.system = None
+        self._placeholder = use_placeholder
 
-        self.geometry_ok = None not in (CAMERA_HEIGHT_M, CAMERA_TILT_DEG, VERTICAL_FOV_DEG)
-        if VICTIM_ON_FLOOR:
-            print("[vision] floor-object mode: rejecting detections above the horizon "
-                  "(that's the wall marker, not the victim)")
-        if self.geometry_ok:
-            from vision.vision_system_v2_0 import ground_distance_from_bbox_bottom
-            self._ground_distance = ground_distance_from_bbox_bottom
-        else:
-            print("[vision] camera geometry not measured -- NO DISTANCE ESTIMATES.\n"
-                  "         Set CAMERA_HEIGHT_M, CAMERA_TILT_DEG and VERTICAL_FOV_DEG\n"
-                  "         at the top of main.py. APPROACH is disabled until then.")
+        if use_placeholder:
+            print("[vision] PLACEHOLDER detector -- not the real vision system")
+            return
 
-        self.detect_boxes = self._placeholder if use_placeholder else self._find_detector()
-
-    def _find_detector(self):
-        """Build the real ColourDetector, or explain precisely what's missing."""
+        from vision_system_v2_0 import VisionSystem
+        profiles = os.path.join(_VISION_DIR, "profiles.pkl")
+        if not os.path.exists(profiles):
+            raise SystemExit(f"profiles.pkl not found at {profiles}")
+        cwd = os.getcwd()
         try:
-            from colour_detector import ColourDetector
-        except ImportError as exc:
-            raise SystemExit(self._missing_msg(f"import failed: {exc}"))
+            # VisionSystem and MarkerDetector both open paths relative to the cwd
+            # (profiles.pkl, templates/), so run their construction from vision/.
+            os.chdir(_VISION_DIR)
+            self.system = VisionSystem("profiles.pkl")
+        finally:
+            os.chdir(cwd)
+        print(f"[vision] VisionSystem, filtering for {VICTIM_CLASS_NAME!r}"
+              f"{' on the floor' if VICTIM_ON_FLOOR else ''}")
 
-        # ColourDetector opens profiles_file relative to the cwd, so give it a path
-        # that works no matter where main.py was launched from.
-        for candidate in (os.path.join(_REPO_ROOT, "profiles.pkl"),
-                          os.path.join(_REPO_ROOT, "vision", "profiles.pkl"),
-                          "profiles.pkl"):
-            if os.path.exists(candidate):
-                detector = ColourDetector(candidate)
-                break
+    def _is_target(self, det):
+        """Is this detection the victim OBJECT, as opposed to its wall marker?"""
+        if det.get("class") != VICTIM_CLASS_NAME:
+            return False
+        if not det.get("is_ground_object", False):
+            return False                       # a marker-template hit
+        if VICTIM_ON_FLOOR and not is_on_floor(det["bbox"], self.frame_h):
+            return False                       # colour hit on the wall marker
+        return True
+
+    def look(self):
+        """The nearest victim, None if there isn't one, UNUSABLE if we can't tell."""
+        frame = self.camera.read()
+        if frame is None:
+            return UNUSABLE
+        self.frame_h, self.frame_w = frame.shape[:2]
+
+        if self._placeholder:
+            boxes = self._placeholder_boxes(frame)
+            dets = [{"class": VICTIM_CLASS_NAME, "bbox": b, "is_ground_object": True,
+                     "angle_deg": self._angle(b), "distance_m": None} for b in boxes]
         else:
-            raise SystemExit(self._missing_msg("profiles.pkl not found"))
+            dets = self.system.classify_frame(frame)
+            if dets is None:
+                return UNUSABLE                # too blurred to conclude anything
 
-        names = set(detector.classes)
-        if VICTIM_CLASS_NAME not in names:
-            raise SystemExit(
-                f"profiles.pkl has no {VICTIM_CLASS_NAME!r} class -- it holds {sorted(names)}.\n"
-                "Set VICTIM_CLASS_NAME at the top of main.py to whichever of those is the victim.")
-        print(f"[vision] ColourDetector, filtering for {VICTIM_CLASS_NAME!r}")
+        victims = [d for d in dets if self._is_target(d)]
+        if not victims:
+            return None
 
-        def detect_victim_boxes(frame):
-            # A candidate can carry several class names when a colour is shared
-            # between classes; keep it if victim is among them.
-            return [c["bbox"] for c in detector.detect(frame)
-                    if VICTIM_CLASS_NAME in c["candidate_classes"]]
+        # Largest box = nearest. Fine while one victim is in frame at a time.
+        best = max(victims, key=lambda d: d["bbox"][2] * d["bbox"][3])
+        x, y, w, h = best["bbox"]
+        return Victim(best["angle_deg"], best["distance_m"], best["bbox"], w * h)
 
-        return detect_victim_boxes
+    def _angle(self, bbox):
+        from camera_capture_v2_0 import pixel_x_to_angle
+        x, _, w, _ = bbox
+        return pixel_x_to_angle(x + w / 2.0, self.frame_w)
 
-    @staticmethod
-    def _missing_msg(why):
-        return (
-            f"Victim detector unavailable -- {why}\n\n"
-            "  colour_detector.py is in the repo, but two things it needs are not:\n"
-            "    class_profile_v2_0.py   the ClassProfile class, needed to unpickle\n"
-            "    profiles.pkl            the calibrated HSV bands themselves\n"
-            "  Both are produced/held by Kushal's calibration step. Ask him to push them\n"
-            "  (profiles.pkl is a build artefact, so it may be gitignored on his side).\n\n"
-            "  Meanwhile: python3 main.py --placeholder-vision  exercises the nav loop."
-        )
-
-    def _placeholder(self, frame_bgr):
-        """STAND-IN ONLY. A crude HSV blob finder so the loop can be demonstrated
-        before the real detector lands. Do not present this as the vision system."""
+    def _placeholder_boxes(self, frame_bgr):
+        """STAND-IN ONLY -- a crude HSV blob finder. Not a vision system."""
         import cv2
         import numpy as np
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, np.array(PLACEHOLDER_HSV_LOW), np.array(PLACEHOLDER_HSV_HIGH))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        boxes = [cv2.boundingRect(c) for c in contours
-                 if cv2.contourArea(c) >= PLACEHOLDER_MIN_AREA_PX]
-        return sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
-
-    def look(self):
-        """One frame -> the closest/largest victim, or None."""
-        frame = self.camera.read()
-        if frame is None:
-            return None
-        self.frame_h, self.frame_w = frame.shape[:2]
-
-        boxes = self.detect_boxes(frame)
-        if VICTIM_ON_FLOOR:
-            # Drop the wall marker: same colour, but its base sits above the horizon.
-            boxes = [b for b in boxes if is_on_floor(b, self.frame_h)]
-        if not boxes:
-            return None
-
-        # Largest box = nearest victim. Good enough while only one is in frame;
-        # revisit if the demo ever has two at once.
-        x, y, w, h = max(boxes, key=lambda b: b[2] * b[3])
-        bearing = self._pixel_x_to_angle(x + w / 2.0, self.frame_w,
-                                         fov_deg=HORIZONTAL_FOV_DEG)
-
-        distance = None
-        if self.geometry_ok:
-            distance = self._ground_distance(
-                y + h, self.frame_h,
-                camera_height_m=CAMERA_HEIGHT_M,
-                camera_tilt_deg=CAMERA_TILT_DEG,
-                vertical_fov_deg=VERTICAL_FOV_DEG)
-
-        return Victim(bearing, distance, (x, y, w, h), w * h)
+        return [cv2.boundingRect(c) for c in contours
+                if cv2.contourArea(c) >= PLACEHOLDER_MIN_AREA_PX]
 
     def close(self):
         try:
@@ -593,7 +577,12 @@ class Nav:
 
         # Debounce both ways: a single frame should neither trigger an approach
         # nor abandon one. Cheap insurance against detector flicker.
-        if seen is not None:
+        if seen is UNUSABLE:
+            # Blurred frame or dropped capture -- no evidence either way. Hold the
+            # counters and keep acting on what we already believe, rather than
+            # letting a fast pan read as the victim disappearing.
+            pass
+        elif seen is not None:
             self.hits, self.misses = self.hits + 1, 0
             self.victim = seen
         else:

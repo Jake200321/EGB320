@@ -33,7 +33,10 @@ USB_CAMERA_INDEX = 0
 # changes. Everything that computes a bearing angle to a detected object
 # depends on this being accurate; a wrong FOV here silently miscalibrates
 # every angle downstream even though the pixel math is otherwise correct.
-HORIZONTAL_FOV_DEG = 45.0
+# Camera Module 3 standard lens is 66 x 41 deg (75 deg diagonal, per the Raspberry Pi
+# product brief). This was 45.0, which cannot be right next to a 41 deg vertical --
+# 45 x 41 is not a real 4:3 lens. Too small a value understates every bearing.
+HORIZONTAL_FOV_DEG = 66.0
 
 
 def pixel_x_to_angle(x, frame_width, fov_deg=HORIZONTAL_FOV_DEG):
@@ -54,8 +57,8 @@ def pixel_x_to_angle(x, frame_width, fov_deg=HORIZONTAL_FOV_DEG):
 # just a bit noisy), which is worse for navigation than having no distance
 # at all. Measure them on the real robot and set them here before trusting
 # any output from ground_distance_from_bbox_bottom.
-CAMERA_HEIGHT_M = None    # camera's height above the floor, in metres
-CAMERA_TILT_DEG = None    # how far the camera points DOWN from level --
+CAMERA_HEIGHT_M = 0.10    # measured on the robot 2026-09-09
+CAMERA_TILT_DEG = 0.0     # mounted level. How far it points DOWN from level --
                            # 0.0 if mounted perfectly horizontal
 
 # A SEPARATE number from HORIZONTAL_FOV_DEG -- don't assume a lens is
@@ -63,7 +66,7 @@ CAMERA_TILT_DEG = None    # how far the camera points DOWN from level --
 # approximates the vertical one for a simple rectilinear lens with square
 # pixels: tan(v_fov/2) ~= tan(h_fov/2) * (frame_height / frame_width). A
 # real spec-sheet number beats this approximation if you have one.
-VERTICAL_FOV_DEG = None
+VERTICAL_FOV_DEG = 41.0   # Camera Module 3 standard lens
 
 
 def pixel_y_to_depression_angle(y, frame_height, vertical_fov_deg):

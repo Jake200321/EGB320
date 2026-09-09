@@ -6,3 +6,6 @@ venv/
 
 # DFRobot motor HAT library -- cloned, not ours. See Robot_Code/motor_spin_test.py
 Robot_Code/vendor/
+
+# auto-created by marker_detector when templates are absent
+vision/templates/
