@@ -197,5 +197,37 @@ n = M.Nav(d, FakeVision([V()] * 3 + [None] * 12), l, FakeSonar(front=0.50))
 run(n, 15)
 check("empty frames DO drop to SEARCH", n.state == M.SEARCH)
 
+print("15) every name main() reaches for actually exists")
+# The rest of this file injects fakes, so it never touches the real Leds, Drive or
+# Ultrasonics classes -- a refactor once deleted all three and every test still
+# passed. This walks main() for the globals it calls and checks they're defined.
+import ast
+_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")).read()
+_tree = ast.parse(_src)
+_main_fn = next(n for n in _tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+_called = {n.func.id for n in ast.walk(_main_fn)
+           if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+_missing = sorted(c for c in _called if not hasattr(M, c) and not hasattr(__builtins__, c)
+                  and c not in dir(__builtins__))
+check(f"main() references nothing undefined{(' -- missing ' + ', '.join(_missing)) if _missing else ''}",
+      not _missing)
+for _name in ("Leds", "Drive", "Ultrasonics", "VictimVision", "Display", "Nav",
+              "StatusLine", "render_hud", "status_text", "horizon_row", "is_on_floor"):
+    check(f"{_name} is defined", hasattr(M, _name))
+
+print("16) the real Leds and Ultrasonics construct off-Pi")
+# Both must degrade instead of raising when there's no GPIO, or nothing can be
+# tested on a laptop.
+_leds = M.Leds()
+_leds.green(True); _leds.yellow(True); _leds.red(True); _leds.all_off()
+check("Leds falls back to console without gpiozero", _leds.real is False)
+_son = M.Ultrasonics(enabled=False)
+check("Ultrasonics(enabled=False) reports unavailable", _son.available is False)
+check("...and returns no reading rather than raising", _son.front is None)
+_son.update()
+check("...and update() is a no-op", _son.get("front") is None)
+_st = M.status_text(M.Nav(FakeDrive(), FakeVision([]), _leds, _son), _son, _leds, 20.0)
+check("status_text renders", "EXPLORING" in _st and "sonar" in _st)
+
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)

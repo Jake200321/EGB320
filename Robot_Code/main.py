@@ -303,6 +303,174 @@ def render_hud(frame, detections, nav, sonar, draw_detections=None):
 
 
 # ===========================================================================
+# LEDs
+# ===========================================================================
+class Leds:
+    """Green = victim tracked. Yellow = collection placeholder, flashed by the loop.
+
+    Falls back to console printing when gpiozero isn't available or the pins can't be
+    claimed, so the nav logic stays testable on a laptop.
+    """
+
+    def __init__(self, green_pin=GREEN_LED_BCM, yellow_pin=YELLOW_LED_BCM,
+                 red_pin=RED_LED_BCM):
+        self.real = False
+        try:
+            from gpiozero import LED
+            self._green = LED(green_pin)
+            self._yellow = LED(yellow_pin)
+            self._red = LED(red_pin)
+            self.real = True
+            print(f"[leds] GPIO {green_pin} green, {yellow_pin} yellow, {red_pin} red")
+        except Exception as exc:                       # noqa: BLE001
+            print(f"[leds] CONSOLE ONLY -- {type(exc).__name__}: {exc}")
+        self._state = {"green": None, "yellow": None, "red": None}
+
+    def _set(self, name, obj, on):
+        if self._state[name] == on:
+            return                                     # only log real transitions
+        self._state[name] = on
+        if self.real:
+            obj.on() if on else obj.off()
+        else:
+            print(f"[led] {name} {'ON' if on else 'off'}")
+
+    def green(self, on):
+        self._set("green", getattr(self, "_green", None), on)
+
+    def yellow(self, on):
+        self._set("yellow", getattr(self, "_yellow", None), on)
+
+    def red(self, on):
+        # Wired and driveable, but nothing sets it yet -- there's no return-to-base
+        # state in the FSM. Left here so that behaviour has somewhere to land.
+        self._set("red", getattr(self, "_red", None), on)
+
+    def all_off(self):
+        try:
+            self.green(False)
+            self.yellow(False)
+            self.red(False)
+        except Exception:                              # noqa: BLE001
+            pass
+
+
+# ===========================================================================
+# Ultrasonics
+# ===========================================================================
+class Ultrasonic:
+    """One HC-SR04 / SRF05 on a trigger + echo pair.
+
+    Timed in Python, so expect a centimetre or two of jitter -- fine against a 10 cm
+    stop threshold, and no worse than gpiozero's own DistanceSensor, which does the
+    same thing. Pinging is explicit rather than free-running precisely so the three
+    sensors can be sequenced and never hear each other's echoes.
+    """
+
+    SPEED_OF_SOUND = 343.0     # m/s at ~20 C
+
+    def __init__(self, trig_bcm, echo_bcm, max_range_m=US_MAX_RANGE_M):
+        from gpiozero import DigitalInputDevice, DigitalOutputDevice
+        self.trig = DigitalOutputDevice(trig_bcm)
+        self.echo = DigitalInputDevice(echo_bcm)
+        self.max_range_m = max_range_m
+        # Longest an echo can legitimately take, plus margin. Past this there was
+        # no echo -- nothing in range -- which is a normal answer, not a fault.
+        self._timeout_s = (2.0 * max_range_m / self.SPEED_OF_SOUND) + 0.01
+
+    def ping(self):
+        """Distance in metres, or None if nothing answered within range."""
+        self.trig.on()
+        time.sleep(0.00001)                    # 10 us trigger pulse
+        self.trig.off()
+
+        deadline = time.monotonic() + self._timeout_s
+        while not self.echo.value:             # wait for the echo to go high
+            if time.monotonic() > deadline:
+                return None
+        rise = time.monotonic()
+
+        deadline = rise + self._timeout_s
+        while self.echo.value:                 # ...and for it to fall again
+            if time.monotonic() > deadline:
+                return None
+        width = time.monotonic() - rise
+
+        distance = width * self.SPEED_OF_SOUND / 2.0
+        return distance if 0.0 < distance <= self.max_range_m else None
+
+
+class Ultrasonics:
+    """All three sensors, fired one per tick so they never overlap.
+
+    Front is polled twice as often as the sides: it's the input to the stop decision,
+    where the sides only inform wall logic. Readings go stale rather than lingering --
+    a 2-second-old range is worse than admitting you don't know.
+    """
+
+    # front, left, front, right -- front lands on half the ticks
+    ORDER = ["front", "left", "front", "right"]
+
+    def __init__(self, pins=None, enabled=True):
+        self.sensors = {}
+        self.readings = {}                     # name -> (distance_m|None, timestamp)
+        self._i = 0
+        self._last_ping = 0.0
+        if not enabled:
+            print("[sonar] disabled (--no-sonar)")
+            return
+        for name, (trig, echo) in (pins or ULTRASONIC_PINS).items():
+            try:
+                self.sensors[name] = Ultrasonic(trig, echo)
+            except Exception as exc:           # noqa: BLE001
+                print(f"[sonar] {name} unavailable on TRIG {trig}/ECHO {echo} -- "
+                      f"{type(exc).__name__}: {exc}")
+        if self.sensors:
+            print(f"[sonar] {', '.join(sorted(self.sensors))}")
+
+    def update(self):
+        """Fire at most one sensor. Call once per control tick."""
+        if not self.sensors:
+            return
+        now = time.monotonic()
+        if now - self._last_ping < US_MIN_TRIGGER_GAP_S:
+            return                             # too soon; last echo may still be alive
+        name = self.ORDER[self._i % len(self.ORDER)]
+        self._i += 1
+        sensor = self.sensors.get(name)
+        if sensor is None:
+            return
+        self._last_ping = now
+        self.readings[name] = (sensor.ping(), now)
+
+    def get(self, name):
+        """Latest range in metres, or None if unknown, out of range, or stale."""
+        entry = self.readings.get(name)
+        if entry is None:
+            return None
+        distance, t = entry
+        if time.monotonic() - t > US_STALE_AFTER_S:
+            return None
+        return distance
+
+    @property
+    def front(self):
+        return self.get("front")
+
+    @property
+    def available(self):
+        return "front" in self.sensors
+
+    def walls(self):
+        """(left, right) booleans -- is there a wall alongside? None = don't know."""
+        out = []
+        for side in ("left", "right"):
+            d = self.get(side)
+            out.append(None if d is None else d < WALL_NEAR_M)
+        return tuple(out)
+
+
+# ===========================================================================
 # Drive
 # ===========================================================================
 class Drive:
