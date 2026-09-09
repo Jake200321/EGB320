@@ -148,22 +148,25 @@ check("claims no distance off-axis", n.victim_range()[0] is None)
 check("turns to centre it", abs(d.last[1]) > 0)
 check("does NOT close on an unknown range", d.last[0] == 0.0)
 
-print("10) wall marker: camera range refused (bbox bottom isn't on the floor)")
-M.VICTIM_IS_WALL_MARKER = True
-n = M.Nav(FakeDrive(), FakeVision([V(0.40, 30.0)] * 6, geometry_ok=True), FakeLeds(),
-          FakeSonar(front=0.50))
-run(n, 6)
-check("camera estimate not used for a marker", n.victim_range()[0] is None)
+print("10) horizon filter separates the floor victim from the wall marker")
+# 480-row frame, camera level -> horizon at row 240. The victim object rests on the
+# floor so its base is below that; the marker is mounted up the wall, above it.
+check("horizon is the centre row when level", abs(M.horizon_row(480) - 240.0) < 1e-6)
+check("victim on the floor is kept",     M.is_on_floor((300, 200, 60, 90), 480))   # base 290
+check("wall marker is rejected",     not M.is_on_floor((300, 120, 60, 70), 480))   # base 190
+check("a box straddling the horizon counts as floor",
+      M.is_on_floor((300, 180, 60, 90), 480))                                      # base 270
+check("tilting down raises the horizon",
+      M.horizon_row(480, tilt_deg=10.0, vfov_deg=41.0) < 240.0)
 
-print("11) floor object: camera range allowed when off-axis")
-M.VICTIM_IS_WALL_MARKER = False
+print("11) floor object: camera range used when the victim is off-axis")
+M.VICTIM_ON_FLOOR = True
 n = M.Nav(FakeDrive(), FakeVision([V(0.40, 30.0)] * 6, geometry_ok=True), FakeLeds(),
           FakeSonar(front=0.50))
 run(n, 6)
 dist, src = n.victim_range()
 check("falls back to the camera", src == "camera")
 check("uses the camera's number, not the sonar's", abs(dist - 0.40) < 1e-9)
-M.VICTIM_IS_WALL_MARKER = True
 
 print("12) echo lost mid-approach: halt rather than coast on a stale range")
 d, son = FakeDrive(), FakeSonar(front=0.50)

@@ -60,15 +60,19 @@ US_TRUST_BEARING_DEG = 10.0 # only believe the front sonar is ranging the VICTIM
 
 VICTIM_CLASS_NAME = "victim"   # matches the profiles.pkl classes: obstacle/ramp/rubble/victim
 
-# Kushal's 'victim' profile is trained on victim MARKER images -- placards mounted
-# partway UP a wall, not an object sitting on the floor. That breaks the camera
-# range estimator: ground_distance_from_bbox_bottom assumes the bottom of the bbox
-# is where the object touches the ground, and its own docstring says calling it on a
-# marker gives a confidently wrong number. So while this is True the camera fallback
-# stays off and the front sonar -- which ranges the wall the marker is on, which is
-# what we actually want to stop 10 cm short of -- is the only estimator used.
-# Set False if the demo target becomes a floor-standing victim object instead.
-VICTIM_IS_WALL_MARKER = True
+# The demo target is the victim OBJECT on the floor. But the arena also carries the
+# wall MARKER that depicts a victim, and Kushal's 'victim' colour profile is trained
+# on marker images -- so it will happily match both, and nav would otherwise be free
+# to drive at whichever happens to look bigger.
+#
+# They're separated geometrically. The camera is level at 10 cm, so the horizon is
+# the image centre row: anything resting on the floor has its base BELOW that row,
+# and a marker mounted partway up a wall sits at or above it. Filtering on that both
+# discards the marker and guarantees the surviving detections are on the ground
+# plane, which is exactly the assumption ground_distance_from_bbox_bottom needs --
+# so the camera range estimator becomes valid at the same time.
+VICTIM_ON_FLOOR = True
+HORIZON_MARGIN_PX = 8       # slack for mounting tolerance and tilt error
 
 STOP_DISTANCE_M = 0.10      # stop this far short of the victim (assessment: 10 cm)
 DISTANCE_TOLERANCE_M = 0.02 # close enough -- stops hunting back and forth
@@ -348,6 +352,33 @@ class Drive:
 # ===========================================================================
 # Vision
 # ===========================================================================
+def horizon_row(frame_h, tilt_deg=None, vfov_deg=None):
+    """Image row where the ground plane meets the horizon.
+
+    Level camera -> the centre row. Tilted down -> the horizon rises up the frame.
+    Everything below this row is ground; everything above is wall, marker or sky.
+    """
+    tilt = CAMERA_TILT_DEG if tilt_deg is None else tilt_deg
+    vfov = VERTICAL_FOV_DEG if vfov_deg is None else vfov_deg
+    if tilt is None or vfov is None:
+        return frame_h / 2.0                      # best guess: assume level
+    half = frame_h / 2.0
+    # inverse of pixel_y_to_depression_angle at a depression of -tilt
+    offset = math.tan(math.radians(-tilt)) / math.tan(math.radians(vfov / 2.0))
+    return half * (1.0 + offset)
+
+
+def is_on_floor(bbox, frame_h, margin_px=None):
+    """True if this bbox's base is below the horizon, i.e. it's standing on the floor.
+
+    This is what tells the victim object apart from the wall marker of the same colour.
+    """
+    margin = HORIZON_MARGIN_PX if margin_px is None else margin_px
+    _, y, _, h = bbox
+    return (y + h) > horizon_row(frame_h) + margin
+
+
+
 class Victim:
     """One victim detection, already converted out of pixel space."""
 
@@ -377,6 +408,9 @@ class VictimVision:
         self.frame_w = self.frame_h = None
 
         self.geometry_ok = None not in (CAMERA_HEIGHT_M, CAMERA_TILT_DEG, VERTICAL_FOV_DEG)
+        if VICTIM_ON_FLOOR:
+            print("[vision] floor-object mode: rejecting detections above the horizon "
+                  "(that's the wall marker, not the victim)")
         if self.geometry_ok:
             from vision.vision_system_v2_0 import ground_distance_from_bbox_bottom
             self._ground_distance = ground_distance_from_bbox_bottom
@@ -453,6 +487,9 @@ class VictimVision:
         self.frame_h, self.frame_w = frame.shape[:2]
 
         boxes = self.detect_boxes(frame)
+        if VICTIM_ON_FLOOR:
+            # Drop the wall marker: same colour, but its base sits above the horizon.
+            boxes = [b for b in boxes if is_on_floor(b, self.frame_h)]
         if not boxes:
             return None
 
@@ -531,7 +568,7 @@ class Nav:
             d = self.sonar.front
             if d is not None:
                 return d, "sonar"
-        if v.distance_m is not None and not VICTIM_IS_WALL_MARKER:
+        if v.distance_m is not None and VICTIM_ON_FLOOR:
             return v.distance_m, "camera"
         return None, None
 
