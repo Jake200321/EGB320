@@ -5,10 +5,19 @@
     yellow LED FLASH  once stopped within STOP_DISTANCE_M -- placeholder standing in
                       for Roger's collection mechanism
 
-    python3 main.py                      # full run
+    python3 main.py                      # full run, with the live camera window
     python3 main.py --no-motors          # everything except driving (motor HAT is dead)
+    python3 main.py --no-display         # headless / over SSH with no X
     python3 main.py --placeholder-vision # use the stand-in detector, NOT Kushal's
     python3 main.py --check              # wire everything up, report, exit
+    python3 main.py --sonar-test         # just the three ranges, live
+
+While it runs you get three views of what it's doing:
+  * a camera window with Kushal's detection overlay, the horizon line, the victim
+    nav has locked onto, the live range and the sonar readout. q or ESC quits.
+  * a status line rewriting in place: state, victim bearing and range, all three
+    sonar readings, which LEDs are lit, and the measured loop rate.
+  * event lines above it whenever the state changes or a victim is reached.
 
 Runs with pieces missing on purpose. The motor HAT doesn't enumerate yet and the real
 victim detector isn't in the repo, so each subsystem degrades to a named stub and says
@@ -123,171 +132,174 @@ PLACEHOLDER_MIN_AREA_PX = 400
 
 
 # ===========================================================================
-# LEDs
+# Terminal status + live camera window
 # ===========================================================================
-class Leds:
-    """Green = victim tracked. Yellow = collection placeholder, flashed by the loop.
+WINDOW_NAME = "EGB320 nav"
 
-    Falls back to console printing when gpiozero isn't available or the pins can't be
-    claimed, so the nav logic stays testable on a laptop.
+# What each state is actually doing, in words, for the terminal and the HUD.
+STATE_LABEL = {
+    "SEARCH":    "EXPLORING",
+    "APPROACH":  "APPROACHING VICTIM",
+    "AT_VICTIM": "ENGAGING RESCUE",
+}
+
+
+class StatusLine:
+    """One self-rewriting line of live telemetry, plus event lines above it.
+
+    Events (state changes, warnings) have to clear the status line before printing or
+    they land on top of it and leave fragments behind, so everything routes through
+    here rather than calling print() directly.
     """
 
-    def __init__(self, green_pin=GREEN_LED_BCM, yellow_pin=YELLOW_LED_BCM,
-                 red_pin=RED_LED_BCM):
-        self.real = False
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self._width = 0
+
+    def event(self, message):
+        if self.enabled and self._width:
+            print("\r" + " " * self._width + "\r", end="")
+            self._width = 0
+        print(message, flush=True)
+
+    def update(self, text):
+        if not self.enabled:
+            return
+        pad = max(0, self._width - len(text))
+        print("\r" + text + " " * pad, end="", flush=True)
+        self._width = len(text)
+
+    def close(self):
+        if self.enabled and self._width:
+            print()
+            self._width = 0
+
+
+STATUS = StatusLine()
+
+
+def status_text(nav, sonar, leds, hz):
+    """The live line: what state we're in, what we can see, what the sonar reads."""
+    state = STATE_LABEL.get(nav.state, nav.state)
+
+    v = nav.victim
+    if v is None:
+        target = "victim: none"
+    else:
+        distance, source = nav.victim_range()
+        rng = "range unknown" if distance is None else f"{distance*100:5.1f}cm ({source})"
+        target = f"victim: {v.bearing_deg:+6.1f}deg  {rng}"
+
+    def cm(name):
+        d = sonar.get(name)
+        return "  ---" if d is None else f"{d*100:5.1f}"
+    sonar_txt = f"sonar L{cm('left')} F{cm('front')} R{cm('right')} cm"
+
+    lit = "".join(c if getattr(leds, "_state", {}).get(n) else "-"
+                  for n, c in (("green", "G"), ("yellow", "Y"), ("red", "R")))
+    return f"{state:<19}| {target:<38}| {sonar_txt} | {lit} | {hz:4.1f}Hz"
+
+
+class Display:
+    """Live camera window with the vision overlays plus a nav HUD.
+
+    Off automatically when there's no GUI to draw into -- opencv-python-headless has
+    no imshow at all, and an SSH session without X forwarding has nowhere to put a
+    window. Either case disables the window and says so, rather than killing the run.
+    """
+
+    def __init__(self, enabled=True):
+        self.ok = False
+        self.cv2 = None
+        if not enabled:
+            return
         try:
-            from gpiozero import LED
-            self._green = LED(green_pin)
-            self._yellow = LED(yellow_pin)
-            self._red = LED(red_pin)
-            self.real = True
-            print(f"[leds] GPIO {green_pin} green, {yellow_pin} yellow, {red_pin} red")
+            import cv2
+            if not hasattr(cv2, "imshow"):
+                raise RuntimeError("this OpenCV build has no GUI (opencv-python-headless)")
+            cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(WINDOW_NAME, 800, 600)
+            self.cv2 = cv2
+            self.ok = True
+            STATUS.event(f"[display] window '{WINDOW_NAME}' open -- q or ESC to quit")
         except Exception as exc:                       # noqa: BLE001
-            print(f"[leds] CONSOLE ONLY -- {type(exc).__name__}: {exc}")
-        self._state = {"green": None, "yellow": None, "red": None}
+            STATUS.event(f"[display] no camera window -- {type(exc).__name__}: {exc}\n"
+                         "          (headless OpenCV, or no X display over SSH). "
+                         "Everything else still runs; --no-display silences this.")
 
-    def _set(self, name, obj, on):
-        if self._state[name] == on:
-            return                                     # only log real transitions
-        self._state[name] = on
-        if self.real:
-            obj.on() if on else obj.off()
-        else:
-            print(f"[led] {name} {'ON' if on else 'off'}")
+    def show(self, frame, detections, nav, sonar, draw_detections=None):
+        """Draw and display one frame. Returns False if the user asked to quit."""
+        if not self.ok or frame is None:
+            return True
+        self.cv2.imshow(WINDOW_NAME, render_hud(frame, detections, nav, sonar,
+                                                draw_detections))
+        return self.cv2.waitKey(1) & 0xFF not in (ord("q"), 27)
 
-    def green(self, on):
-        self._set("green", getattr(self, "_green", None), on)
+    def close(self):
+        if self.ok:
+            try:
+                self.cv2.destroyAllWindows()
+            except Exception:                          # noqa: BLE001
+                pass
 
-    def yellow(self, on):
-        self._set("yellow", getattr(self, "_yellow", None), on)
 
-    def red(self, on):
-        # Wired and driveable, but nothing sets it yet -- there's no return-to-base
-        # state in the FSM. Left here so that behaviour has somewhere to land.
-        self._set("red", getattr(self, "_red", None), on)
+def render_hud(frame, detections, nav, sonar, draw_detections=None):
+    """Overlay the vision output and nav's own state onto a copy of the frame.
 
-    def all_off(self):
+    Separate from Display so it can be rendered and checked without a GUI.
+
+    Draw order matters: the state banner goes down first, then Kushal's detection
+    overlay on top of it, so his own readout isn't hidden behind our bar.
+    """
+    import cv2
+    img = frame.copy()
+    h, w = img.shape[:2]
+
+    # --- state banner ---
+    state = STATE_LABEL.get(nav.state, nav.state)
+    colour = {"SEARCH": (200, 200, 200), "APPROACH": (0, 220, 255),
+              "AT_VICTIM": (0, 255, 0)}.get(nav.state, (255, 255, 255))
+    cv2.rectangle(img, (0, 0), (w, 30), (0, 0, 0), -1)
+    cv2.putText(img, state, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.65, colour, 2)
+
+    distance, source = nav.victim_range() if nav.victim is not None else (None, None)
+    if distance is not None:
+        txt = f"{distance*100:.1f} cm ({source})   stop at {STOP_DISTANCE_M*100:.0f}"
+        cv2.putText(img, txt, (w - 330, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (0, 255, 0) if distance > STOP_DISTANCE_M else (0, 0, 255), 2)
+
+    # --- Kushal's overlay: boxes, class, confidence, angle, distance ---
+    if draw_detections is not None and detections:
         try:
-            self.green(False)
-            self.yellow(False)
-            self.red(False)
+            draw_detections(img, detections)
         except Exception:                              # noqa: BLE001
             pass
 
+    # --- horizon: below it is floor. This line is what separates the victim object
+    # from its wall marker, so being able to see it is the point.
+    hy = int(horizon_row(h))
+    cv2.line(img, (0, hy), (w, hy), (80, 80, 255), 1)
+    cv2.putText(img, "horizon", (6, max(12, hy - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (80, 80, 255), 1)
 
-# ===========================================================================
-# Ultrasonics
-# ===========================================================================
-class Ultrasonic:
-    """One HC-SR04 / SRF05 on a trigger + echo pair.
+    # --- the victim nav has actually locked onto, distinct from everything else ---
+    if nav.victim is not None:
+        x, y, bw, bh = nav.victim.bbox
+        cv2.rectangle(img, (x, y), (x + bw, y + bh), (0, 220, 255), 3)
+        cx = x + bw // 2
+        cv2.line(img, (cx, y), (cx, y + bh), (0, 220, 255), 1)
+        cv2.circle(img, (w // 2, h - 30), 4, (255, 255, 255), -1)
+        cv2.line(img, (w // 2, h - 30), (cx, y + bh), (0, 220, 255), 1)
 
-    Timed in Python, so expect a centimetre or two of jitter -- fine against a 10 cm
-    stop threshold, and no worse than gpiozero's own DistanceSensor, which does the
-    same thing. Pinging is explicit rather than free-running precisely so the three
-    sensors can be sequenced and never hear each other's echoes.
-    """
-
-    SPEED_OF_SOUND = 343.0     # m/s at ~20 C
-
-    def __init__(self, trig_bcm, echo_bcm, max_range_m=US_MAX_RANGE_M):
-        from gpiozero import DigitalInputDevice, DigitalOutputDevice
-        self.trig = DigitalOutputDevice(trig_bcm)
-        self.echo = DigitalInputDevice(echo_bcm)
-        self.max_range_m = max_range_m
-        # Longest an echo can legitimately take, plus margin. Past this there was
-        # no echo -- nothing in range -- which is a normal answer, not a fault.
-        self._timeout_s = (2.0 * max_range_m / self.SPEED_OF_SOUND) + 0.01
-
-    def ping(self):
-        """Distance in metres, or None if nothing answered within range."""
-        self.trig.on()
-        time.sleep(0.00001)                    # 10 us trigger pulse
-        self.trig.off()
-
-        deadline = time.monotonic() + self._timeout_s
-        while not self.echo.value:             # wait for the echo to go high
-            if time.monotonic() > deadline:
-                return None
-        rise = time.monotonic()
-
-        deadline = rise + self._timeout_s
-        while self.echo.value:                 # ...and for it to fall again
-            if time.monotonic() > deadline:
-                return None
-        width = time.monotonic() - rise
-
-        distance = width * self.SPEED_OF_SOUND / 2.0
-        return distance if 0.0 < distance <= self.max_range_m else None
-
-
-class Ultrasonics:
-    """All three sensors, fired one per tick so they never overlap.
-
-    Front is polled twice as often as the sides: it's the input to the stop decision,
-    where the sides only inform wall logic. Readings go stale rather than lingering --
-    a 2-second-old range is worse than admitting you don't know.
-    """
-
-    # front, left, front, right -- front lands on half the ticks
-    ORDER = ["front", "left", "front", "right"]
-
-    def __init__(self, pins=None, enabled=True):
-        self.sensors = {}
-        self.readings = {}                     # name -> (distance_m|None, timestamp)
-        self._i = 0
-        self._last_ping = 0.0
-        if not enabled:
-            print("[sonar] disabled (--no-sonar)")
-            return
-        for name, (trig, echo) in (pins or ULTRASONIC_PINS).items():
-            try:
-                self.sensors[name] = Ultrasonic(trig, echo)
-            except Exception as exc:           # noqa: BLE001
-                print(f"[sonar] {name} unavailable on TRIG {trig}/ECHO {echo} -- "
-                      f"{type(exc).__name__}: {exc}")
-        if self.sensors:
-            print(f"[sonar] {', '.join(sorted(self.sensors))}")
-
-    def update(self):
-        """Fire at most one sensor. Call once per control tick."""
-        if not self.sensors:
-            return
-        now = time.monotonic()
-        if now - self._last_ping < US_MIN_TRIGGER_GAP_S:
-            return                             # too soon; last echo may still be alive
-        name = self.ORDER[self._i % len(self.ORDER)]
-        self._i += 1
-        sensor = self.sensors.get(name)
-        if sensor is None:
-            return
-        self._last_ping = now
-        self.readings[name] = (sensor.ping(), now)
-
-    def get(self, name):
-        """Latest range in metres, or None if unknown, out of range, or stale."""
-        entry = self.readings.get(name)
-        if entry is None:
-            return None
-        distance, t = entry
-        if time.monotonic() - t > US_STALE_AFTER_S:
-            return None
-        return distance
-
-    @property
-    def front(self):
-        return self.get("front")
-
-    @property
-    def available(self):
-        return "front" in self.sensors
-
-    def walls(self):
-        """(left, right) booleans -- is there a wall alongside? None = don't know."""
-        out = []
-        for side in ("left", "right"):
-            d = self.get(side)
-            out.append(None if d is None else d < WALL_NEAR_M)
-        return tuple(out)
+    # --- sonar readout along the bottom ---
+    cv2.rectangle(img, (0, h - 26), (w, h), (0, 0, 0), -1)
+    parts = []
+    for name in ("left", "front", "right"):
+        d = sonar.get(name)
+        parts.append(f"{name[0].upper()} {'---' if d is None else f'{d*100:.0f}cm'}")
+    cv2.putText(img, "sonar  " + "   ".join(parts), (8, h - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 255, 200), 1)
+    return img
 
 
 # ===========================================================================
@@ -436,6 +448,10 @@ class VictimVision:
         self.geometry_ok = None not in (CH, CT, VF)
         self.system = None
         self._placeholder = use_placeholder
+        # kept for the live window; nav itself only needs the Victim
+        self.last_frame = None
+        self.last_detections = []
+        self.draw_detections = None
 
         if use_placeholder:
             print("[vision] PLACEHOLDER detector -- not the real vision system")
@@ -453,6 +469,7 @@ class VictimVision:
             self.system = VisionSystem("profiles.pkl")
         finally:
             os.chdir(cwd)
+        self.draw_detections = type(self.system).draw_detections
         print(f"[vision] VisionSystem, filtering for {VICTIM_CLASS_NAME!r}"
               f"{' on the floor' if VICTIM_ON_FLOOR else ''}")
 
@@ -469,7 +486,9 @@ class VictimVision:
     def look(self):
         """The nearest victim, None if there isn't one, UNUSABLE if we can't tell."""
         frame = self.camera.read()
+        self.last_frame = frame
         if frame is None:
+            self.last_detections = []
             return UNUSABLE
         self.frame_h, self.frame_w = frame.shape[:2]
 
@@ -480,8 +499,10 @@ class VictimVision:
         else:
             dets = self.system.classify_frame(frame)
             if dets is None:
+                self.last_detections = []
                 return UNUSABLE                # too blurred to conclude anything
 
+        self.last_detections = dets
         victims = [d for d in dets if self._is_target(d)]
         if not victims:
             return None
@@ -530,6 +551,7 @@ class Nav:
         self.victim = None
         self.arrived_at = None
         self.blocked = False
+        self._announced = False
 
     # -- transitions ------------------------------------------------------
     def _enter(self, state):
@@ -541,6 +563,7 @@ class Nav:
             self.arrived_at = time.monotonic()
             self.drive.stop()
         if state == SEARCH:
+            self._announced = False
             self.leds.green(False)
             self.leds.yellow(False)
             self.leds.red(False)
@@ -602,6 +625,9 @@ class Nav:
         self.leds.green(False)
         if confirmed:
             self.leds.green(True)                      # green the moment we commit
+            if not self._announced:
+                STATUS.event("[nav] VICTIM DETECTED -- green LED on")
+                self._announced = True
             if self.can_range:
                 self._enter(APPROACH)
             else:
@@ -641,7 +667,8 @@ class Nav:
             return
 
         if distance - STOP_DISTANCE_M <= DISTANCE_TOLERANCE_M:
-            print(f"[nav] stopping at {distance*100:.1f} cm ({source})")
+            STATUS.event(f"[nav] VICTIM REACHED -- stopping at "
+                         f"{distance*100:.1f} cm ({source})")
             self._enter(AT_VICTIM)
             return
 
@@ -667,6 +694,10 @@ def main():
                     help="print all three ranges continuously and exit on Ctrl-C")
     ap.add_argument("--placeholder-vision", action="store_true",
                     help="stand-in HSV detector instead of the real one")
+    ap.add_argument("--no-display", action="store_true",
+                    help="don't open the camera window (headless / over SSH)")
+    ap.add_argument("--no-status", action="store_true",
+                    help="don't print the live status line")
     ap.add_argument("--check", action="store_true", help="wire up, report, exit")
     args = ap.parse_args()
 
@@ -690,18 +721,20 @@ def main():
             print("\nstopped")
         return
 
+    STATUS.enabled = not args.no_status
     leds = Leds()
     drive = Drive(enabled=not args.no_motors)
     sonar = Ultrasonics(enabled=not args.no_sonar)
     vision = VictimVision(use_placeholder=args.placeholder_vision)
     nav = Nav(drive, vision, leds, sonar)
+    display = Display(enabled=not args.no_display)
 
     ranging = ("front sonar" if sonar.available else
                "camera only" if vision.geometry_ok else "NONE -- approach disabled")
-    print(f"\n[status] motors={'yes' if drive.board else 'NO'}  "
+    STATUS.event(f"[status] motors={'yes' if drive.board else 'NO'}  "
           f"leds={'GPIO' if leds.real else 'console'}  "
-          f"sonar={len(sonar.sensors)}/3  "
-          f"ranging={ranging}\n")
+                 f"sonar={len(sonar.sensors)}/3  "
+                 f"ranging={ranging}")
 
     if args.check:
         for _ in range(12):                    # a few ticks so each sensor reports
@@ -713,20 +746,36 @@ def main():
         drive.stop()
         leds.all_off()
         vision.close()
+        display.close()
         return
 
     period = 1.0 / CONTROL_HZ
+    hz = float(CONTROL_HZ)
     try:
         while True:
             t0 = time.monotonic()
             nav.step()
-            time.sleep(max(0.0, period - (time.monotonic() - t0)))
+
+            # The window draws the frame nav just decided on, so what you see is
+            # exactly what it acted on -- not a fresh capture that may differ.
+            if not display.show(vision.last_frame, vision.last_detections,
+                                nav, sonar, vision.draw_detections):
+                STATUS.event("[display] quit requested")
+                break
+
+            STATUS.update(status_text(nav, sonar, leds, hz))
+            elapsed = time.monotonic() - t0
+            time.sleep(max(0.0, period - elapsed))
+            # measured, not the target -- if vision is slow this is where it shows
+            hz = 0.8 * hz + 0.2 / max(time.monotonic() - t0, 1e-6)
     except KeyboardInterrupt:
-        print("\ninterrupted")
+        STATUS.event("\ninterrupted")
     finally:
+        STATUS.close()
         drive.stop()
         leds.all_off()
         vision.close()
+        display.close()
         print("stopped")
 
 
