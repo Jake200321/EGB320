@@ -178,6 +178,26 @@ n.step()
 check("stops closing", d.last[0] == 0.0)
 check("stays in APPROACH", n.state == M.APPROACH)
 
+print("12b) rescue times out after RESCUE_TIMEOUT_S and stops with red")
+d, l, son = FakeDrive(), FakeLeds(), FakeSonar(front=0.11)
+n = M.Nav(d, FakeVision([V()] * 400), l, son)
+run(n, 4)
+check("reached AT_VICTIM", n.state == M.AT_VICTIM)
+n.arrived_at = time.monotonic() - (M.RESCUE_TIMEOUT_S - 0.2)   # just short of the timeout
+n.step()
+check("still rescuing just before the timeout", n.state == M.AT_VICTIM)
+n.arrived_at = time.monotonic() - (M.RESCUE_TIMEOUT_S + 0.1)   # just past it
+n.step()
+check("DONE once the timeout passes", n.state == M.DONE)
+check("motors stopped", d.last == (0.0, 0.0))
+check("red LED on", l.r is True)
+check("green off", l.g is False)
+check("yellow off", l.y is False)
+run(n, 40)
+check("stays DONE -- terminal, even with a victim in view", n.state == M.DONE)
+check("red stays on", l.r is True)
+check("motors stay stopped", d.last == (0.0, 0.0))
+
 print("13) a blurred frame is not the victim disappearing")
 # classify_frame() returns None on a motion-blurred frame, which is NOT an empty
 # result. Nav must hold what it knows rather than counting it as a miss -- otherwise

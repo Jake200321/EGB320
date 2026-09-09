@@ -114,6 +114,7 @@ MAX_TURN_RATE = 1.2         # rad/s
 DETECTION_DEBOUNCE = 3      # consecutive frames before believing a detection
 LOST_GRACE_FRAMES = 8       # frames a victim may vanish for before we call it lost
 YELLOW_FLASH_HZ = 2.0
+RESCUE_TIMEOUT_S = 10.0     # how long the collection placeholder runs before giving up
 CONTROL_HZ = 20
 
 # --- camera ranging: measured on the robot 2026-09-09 -------------------------
@@ -150,6 +151,7 @@ STATE_LABEL = {
     "SEARCH":    "EXPLORING",
     "APPROACH":  "APPROACHING VICTIM",
     "AT_VICTIM": "ENGAGING RESCUE",
+    "DONE":      "STOPPED (rescue timed out)",
 }
 
 
@@ -291,7 +293,7 @@ def render_hud(frame, detections, nav, sonar, draw_detections=None):
     # --- state banner ---
     state = STATE_LABEL.get(nav.state, nav.state)
     colour = {"SEARCH": (200, 200, 200), "APPROACH": (0, 220, 255),
-              "AT_VICTIM": (0, 255, 0)}.get(nav.state, (255, 255, 255))
+              "AT_VICTIM": (0, 255, 0), "DONE": (0, 0, 255)}.get(nav.state, (255, 255, 255))
     cv2.rectangle(img, (0, 0), (w, 30), (0, 0, 0), -1)
     cv2.putText(img, state, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.65, colour, 2)
 
@@ -776,7 +778,7 @@ class VictimVision:
 # ===========================================================================
 # Nav loop
 # ===========================================================================
-SEARCH, APPROACH, AT_VICTIM = "SEARCH", "APPROACH", "AT_VICTIM"
+SEARCH, APPROACH, AT_VICTIM, DONE = "SEARCH", "APPROACH", "AT_VICTIM", "DONE"
 
 
 class Nav:
@@ -800,6 +802,14 @@ class Nav:
         if state == AT_VICTIM:
             self.arrived_at = time.monotonic()
             self.drive.stop()
+        if state == DONE:
+            # Set the final state here rather than waiting for the next tick, so
+            # there's no window where the robot has stopped but the red LED hasn't
+            # caught up. _done() then just holds it.
+            self.drive.stop()
+            self.leds.green(False)
+            self.leds.yellow(False)
+            self.leds.red(True)
         if state == SEARCH:
             self._announced = False
             self.leds.green(False)
@@ -858,6 +868,8 @@ class Nav:
             self._approach(lost)
         elif self.state == AT_VICTIM:
             self._at_victim()
+        elif self.state == DONE:
+            self._done()
 
     def _search(self, confirmed):
         self.leds.green(False)
@@ -914,12 +926,33 @@ class Nav:
         self.drive.set_velocity(speed, w)
 
     def _at_victim(self):
-        """Stopped 10 cm short. Flash yellow -- Roger's collection code goes here."""
+        """Stopped 10 cm short. Flash yellow -- Roger's collection code goes here.
+
+        Gives up after RESCUE_TIMEOUT_S. The real mechanism will report its own
+        success or failure; until it exists, a fixed timeout stands in for both so
+        the robot ends in a defined state instead of flashing forever.
+        """
         self.drive.stop()
+        elapsed = time.monotonic() - self.arrived_at
+        if elapsed >= RESCUE_TIMEOUT_S:
+            STATUS.event(f"[nav] rescue timed out after {elapsed:.1f}s -- stopping")
+            self._enter(DONE)
+            return
         self.leds.green(True)
-        phase = (time.monotonic() - self.arrived_at) * YELLOW_FLASH_HZ
+        phase = elapsed * YELLOW_FLASH_HZ
         self.leds.yellow(int(phase * 2) % 2 == 0)
         # TODO: rescue.collect() -- replace the flash once the mechanism exists.
+
+    def _done(self):
+        """Terminal. Motors off, red LED solid, nothing else changes.
+
+        Deliberately has no way out: the run is over and the robot should sit still
+        rather than wander off looking for another victim. Restart main.py to go again.
+        """
+        self.drive.stop()
+        self.leds.green(False)
+        self.leds.yellow(False)
+        self.leds.red(True)
 
 
 def main():
