@@ -58,7 +58,17 @@ US_TRUST_BEARING_DEG = 10.0 # only believe the front sonar is ranging the VICTIM
                             # when the victim is this close to centre -- the cone
                             # is ~15 deg and it reports whatever is nearest in it
 
-VICTIM_CLASS_NAME = "victim"   # must match the name in Kushal's profiles.pkl
+VICTIM_CLASS_NAME = "victim"   # matches the profiles.pkl classes: obstacle/ramp/rubble/victim
+
+# Kushal's 'victim' profile is trained on victim MARKER images -- placards mounted
+# partway UP a wall, not an object sitting on the floor. That breaks the camera
+# range estimator: ground_distance_from_bbox_bottom assumes the bottom of the bbox
+# is where the object touches the ground, and its own docstring says calling it on a
+# marker gives a confidently wrong number. So while this is True the camera fallback
+# stays off and the front sonar -- which ranges the wall the marker is on, which is
+# what we actually want to stop 10 cm short of -- is the only estimator used.
+# Set False if the demo target becomes a floor-standing victim object instead.
+VICTIM_IS_WALL_MARKER = True
 
 STOP_DISTANCE_M = 0.10      # stop this far short of the victim (assessment: 10 cm)
 DISTANCE_TOLERANCE_M = 0.02 # close enough -- stops hunting back and forth
@@ -86,8 +96,10 @@ CAMERA_TILT_DEG = None      # degrees below horizontal (0.0 if mounted level)
 VERTICAL_FOV_DEG = None     # Camera Module 3 -- use the VERTICAL spec figure
 
 # Placeholder detector only (--placeholder-vision). NOT Kushal's calibrated bands.
-PLACEHOLDER_HSV_LOW = (20, 120, 120)     # yellow-ish, as the sim's victim token is
-PLACEHOLDER_HSV_HIGH = (35, 255, 255)
+# Taken from the victim entry in profiles.pkl (hue 78-102, green-cyan) so the
+# stand-in at least looks for the right colour. Still not a vision system.
+PLACEHOLDER_HSV_LOW = (78, 183, 135)
+PLACEHOLDER_HSV_HIGH = (102, 255, 255)
 PLACEHOLDER_MIN_AREA_PX = 400
 
 
@@ -510,7 +522,7 @@ class Nav:
             d = self.sonar.front
             if d is not None:
                 return d, "sonar"
-        if v.distance_m is not None:
+        if v.distance_m is not None and not VICTIM_IS_WALL_MARKER:
             return v.distance_m, "camera"
         return None, None
 
