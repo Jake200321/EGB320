@@ -9,3 +9,6 @@ Robot_Code/vendor/
 
 # auto-created by marker_detector when templates are absent
 vision/templates/
+
+# backup written by Robot_Code/tune_class_colour.py
+vision/profiles.pkl.bak
