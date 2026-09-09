@@ -96,4 +96,62 @@ check("stays in SEARCH", n.state==M.SEARCH)
 check("green still ON", l.g is True)
 check("not driving", d.last==(0.0,0.0))
 
+
+# --------------------------------------------------------------- ultrasonics
+class FakeSonar:
+    """Front sonar only, scripted. Sides return nothing."""
+    def __init__(self, front=None, available=True):
+        self._front = front; self.available = available; self.sensors = {"front": 1}
+    def update(self): pass
+    @property
+    def front(self): return self._front
+    def get(self, name): return self._front if name == "front" else None
+    def walls(self): return (None, None)
+
+
+print("8) front sonar alone is enough to approach -- no camera geometry needed")
+d, l = FakeDrive(), FakeLeds()
+n = M.Nav(d, FakeVision([V(None)] * 6, geometry_ok=False), l, FakeSonar(front=0.50))
+for _ in range(6): n.step()
+check("reaches APPROACH on sonar alone", n.state == M.APPROACH)
+check("actually driving forward", d.last[0] > 0)
+check("range came from the sonar", n.victim_range()[1] == "sonar")
+
+print("9) sonar not trusted when the victim is off to one side")
+d, l = FakeDrive(), FakeLeds()
+n = M.Nav(d, FakeVision([V(None, 30.0)] * 6, geometry_ok=False), l, FakeSonar(front=0.50))
+for _ in range(6): n.step()
+check("no distance claimed off-axis", n.victim_range()[0] is None)
+check("turns to centre it", abs(d.last[1]) > 0)
+check("does NOT close on an unknown range", d.last[0] == 0.0)
+
+print("10) sonar stops the robot at 10 cm")
+d, l = FakeDrive(), FakeLeds()
+son = FakeSonar(front=0.50)
+n = M.Nav(d, FakeVision([V(None)] * 30, geometry_ok=False), l, son)
+for _ in range(4): n.step()
+check("approaching", n.state == M.APPROACH)
+son._front = 0.11                     # victim now 11 cm away
+n.step()
+check("AT_VICTIM at 11 cm", n.state == M.AT_VICTIM)
+check("motors stopped", d.last == (0.0, 0.0))
+
+print("11) camera is used when calibrated and the victim is off-axis")
+d, l = FakeDrive(), FakeLeds()
+n = M.Nav(d, FakeVision([V(0.40, 30.0)] * 6, geometry_ok=True), l, FakeSonar(front=0.50))
+for _ in range(6): n.step()
+dist, src = n.victim_range()
+check("falls back to the camera", src == "camera")
+check("uses the camera's number, not the sonar's", abs(dist - 0.40) < 1e-9)
+
+print("12) sonar dropping out mid-approach halts rather than coasting")
+d, l = FakeDrive(), FakeLeds()
+son = FakeSonar(front=0.50)
+n = M.Nav(d, FakeVision([V(None)] * 20, geometry_ok=False), l, son)
+for _ in range(4): n.step()
+son._front = None                     # echo lost
+n.step()
+check("stops closing", d.last[0] == 0.0)
+check("stays in APPROACH", n.state == M.APPROACH)
+
 print("\n%d failed" % len(fails)); sys.exit(1 if fails else 0)

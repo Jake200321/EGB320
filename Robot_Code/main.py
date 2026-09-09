@@ -38,14 +38,32 @@ for _p in (_REPO_ROOT, os.path.join(_REPO_ROOT, "vision")):
 
 GREEN_LED_BCM = 17          # victim detected
 YELLOW_LED_BCM = 27         # collection placeholder
-# NOTE: the DFR0592 HAT covers the 40-pin header and has no passthrough pins.
-# You need a stacking header (or to tap these off the LED board) before any GPIO
-# is physically reachable. See the note at the bottom of this file.
+
+# Ultrasonics: (TRIG_BCM, ECHO_BCM). Front is the primary range to the victim;
+# left/right are for walls. All reachable through the HAT's passthrough pins.
+#
+# *** ECHO IS A 5 V OUTPUT AND PI GPIO IS 3.3 V ONLY ***
+# Wire each ECHO through a divider (1k in series, 2k to ground) or you will
+# eventually damage the pin. TRIG is an input to the sensor and is fine direct.
+ULTRASONIC_PINS = {
+    "front": (23, 24),
+    "left":  (5, 6),
+    "right": (20, 21),
+}
+US_MAX_RANGE_M = 2.0        # ignore anything past this -- beyond the maze anyway
+US_MIN_TRIGGER_GAP_S = 0.06 # HC-SR04 wants >60 ms between pings; sensors are fired
+                            # one at a time so their echoes can't be confused
+US_STALE_AFTER_S = 0.5      # a reading older than this is discarded, not reused
+US_TRUST_BEARING_DEG = 10.0 # only believe the front sonar is ranging the VICTIM
+                            # when the victim is this close to centre -- the cone
+                            # is ~15 deg and it reports whatever is nearest in it
 
 VICTIM_CLASS_NAME = "victim"   # must match the name in Kushal's profiles.pkl
 
 STOP_DISTANCE_M = 0.10      # stop this far short of the victim (assessment: 10 cm)
 DISTANCE_TOLERANCE_M = 0.02 # close enough -- stops hunting back and forth
+COLLISION_STOP_M = 0.12     # front sonar closer than this while searching = wall ahead
+WALL_NEAR_M = 0.20          # side sonar below this = wall alongside
 
 SEARCH_TURN_RATE = 0.6      # rad/s, spin speed while looking for a victim
 APPROACH_SPEED = 0.10       # m/s, closing speed once a victim is being tracked
@@ -59,15 +77,13 @@ LOST_GRACE_FRAMES = 8       # frames a victim may vanish for before we call it l
 YELLOW_FLASH_HZ = 2.0
 CONTROL_HZ = 20
 
-# --- camera geometry: MEASURE THESE ON THE ROBOT --------------------------
-# Feeds vision/vision_system_v2_0.ground_distance_from_bbox_bottom(). Without all
-# three there is no distance estimate, so the 10 cm rule cannot be enforced and
-# APPROACH stays disabled. Nothing here can be guessed -- a wrong number produces a
-# confidently wrong distance, which is worse than none.
+# --- camera ranging: OPTIONAL now, the front sonar is the primary estimator ----
+# Fill these in and the camera becomes a cross-check and a fallback for when the
+# victim is off to one side, where the sonar cone can't be trusted to be seeing it.
+# Nothing here can be guessed -- a wrong value gives a confidently wrong distance.
 CAMERA_HEIGHT_M = None      # lens centre height above the floor, metres
 CAMERA_TILT_DEG = None      # degrees below horizontal (0.0 if mounted level)
-VERTICAL_FOV_DEG = None     # Camera Module 3: 66 deg (standard) / 102 deg (wide) diagonal
-                            # -- use the spec's VERTICAL figure, not the diagonal
+VERTICAL_FOV_DEG = None     # Camera Module 3 -- use the VERTICAL spec figure
 
 # Placeholder detector only (--placeholder-vision). NOT Kushal's calibrated bands.
 PLACEHOLDER_HSV_LOW = (20, 120, 120)     # yellow-ish, as the sim's victim token is
@@ -118,6 +134,121 @@ class Leds:
             self.yellow(False)
         except Exception:                              # noqa: BLE001
             pass
+
+
+# ===========================================================================
+# Ultrasonics
+# ===========================================================================
+class Ultrasonic:
+    """One HC-SR04 / SRF05 on a trigger + echo pair.
+
+    Timed in Python, so expect a centimetre or two of jitter -- fine against a 10 cm
+    stop threshold, and no worse than gpiozero's own DistanceSensor, which does the
+    same thing. Pinging is explicit rather than free-running precisely so the three
+    sensors can be sequenced and never hear each other's echoes.
+    """
+
+    SPEED_OF_SOUND = 343.0     # m/s at ~20 C
+
+    def __init__(self, trig_bcm, echo_bcm, max_range_m=US_MAX_RANGE_M):
+        from gpiozero import DigitalInputDevice, DigitalOutputDevice
+        self.trig = DigitalOutputDevice(trig_bcm)
+        self.echo = DigitalInputDevice(echo_bcm)
+        self.max_range_m = max_range_m
+        # Longest an echo can legitimately take, plus margin. Past this there was
+        # no echo -- nothing in range -- which is a normal answer, not a fault.
+        self._timeout_s = (2.0 * max_range_m / self.SPEED_OF_SOUND) + 0.01
+
+    def ping(self):
+        """Distance in metres, or None if nothing answered within range."""
+        self.trig.on()
+        time.sleep(0.00001)                    # 10 us trigger pulse
+        self.trig.off()
+
+        deadline = time.monotonic() + self._timeout_s
+        while not self.echo.value:             # wait for the echo to go high
+            if time.monotonic() > deadline:
+                return None
+        rise = time.monotonic()
+
+        deadline = rise + self._timeout_s
+        while self.echo.value:                 # ...and for it to fall again
+            if time.monotonic() > deadline:
+                return None
+        width = time.monotonic() - rise
+
+        distance = width * self.SPEED_OF_SOUND / 2.0
+        return distance if 0.0 < distance <= self.max_range_m else None
+
+
+class Ultrasonics:
+    """All three sensors, fired one per tick so they never overlap.
+
+    Front is polled twice as often as the sides: it's the input to the stop decision,
+    where the sides only inform wall logic. Readings go stale rather than lingering --
+    a 2-second-old range is worse than admitting you don't know.
+    """
+
+    # front, left, front, right -- front lands on half the ticks
+    ORDER = ["front", "left", "front", "right"]
+
+    def __init__(self, pins=None, enabled=True):
+        self.sensors = {}
+        self.readings = {}                     # name -> (distance_m|None, timestamp)
+        self._i = 0
+        self._last_ping = 0.0
+        if not enabled:
+            print("[sonar] disabled (--no-sonar)")
+            return
+        for name, (trig, echo) in (pins or ULTRASONIC_PINS).items():
+            try:
+                self.sensors[name] = Ultrasonic(trig, echo)
+            except Exception as exc:           # noqa: BLE001
+                print(f"[sonar] {name} unavailable on TRIG {trig}/ECHO {echo} -- "
+                      f"{type(exc).__name__}: {exc}")
+        if self.sensors:
+            print(f"[sonar] {', '.join(sorted(self.sensors))}")
+
+    def update(self):
+        """Fire at most one sensor. Call once per control tick."""
+        if not self.sensors:
+            return
+        now = time.monotonic()
+        if now - self._last_ping < US_MIN_TRIGGER_GAP_S:
+            return                             # too soon; last echo may still be alive
+        name = self.ORDER[self._i % len(self.ORDER)]
+        self._i += 1
+        sensor = self.sensors.get(name)
+        if sensor is None:
+            return
+        self._last_ping = now
+        self.readings[name] = (sensor.ping(), now)
+
+    def get(self, name):
+        """Latest range in metres, or None if unknown, out of range, or stale."""
+        entry = self.readings.get(name)
+        if entry is None:
+            return None
+        distance, t = entry
+        if time.monotonic() - t > US_STALE_AFTER_S:
+            return None
+        return distance
+
+    @property
+    def front(self):
+        return self.get("front")
+
+    @property
+    def available(self):
+        return "front" in self.sensors
+
+    def walls(self):
+        """(left, right) booleans -- is there a wall alongside? None = don't know."""
+        out = []
+        for side in ("left", "right"):
+            d = self.get(side)
+            out.append(None if d is None else d < WALL_NEAR_M)
+        return tuple(out)
 
 
 # ===========================================================================
@@ -334,13 +465,15 @@ SEARCH, APPROACH, AT_VICTIM = "SEARCH", "APPROACH", "AT_VICTIM"
 
 
 class Nav:
-    def __init__(self, drive, vision, leds):
+    def __init__(self, drive, vision, leds, sonar=None):
         self.drive, self.vision, self.leds = drive, vision, leds
+        self.sonar = sonar if sonar is not None else Ultrasonics(enabled=False)
         self.state = SEARCH
         self.hits = 0            # consecutive frames with a victim
         self.misses = 0          # consecutive frames without one
         self.victim = None
         self.arrived_at = None
+        self.blocked = False
 
     # -- transitions ------------------------------------------------------
     def _enter(self, state):
@@ -355,7 +488,34 @@ class Nav:
             self.leds.green(False)
             self.leds.yellow(False)
 
+    @property
+    def can_range(self):
+        """Either estimator will do. Without one, we refuse to approach."""
+        return self.sonar.available or self.vision.geometry_ok
+
+    def victim_range(self):
+        """Best available distance to the tracked victim, and where it came from.
+
+        The front sonar is the primary estimator, but it ranges whatever is nearest
+        in its cone -- not specifically the victim. So it's only trusted while the
+        victim is near centre; off to one side, the camera estimate (if calibrated)
+        is the honest source, and if neither applies we return None rather than
+        guessing. Approach steers the victim towards centre anyway, so the sonar
+        becomes valid exactly when it matters most -- the last few centimetres.
+        """
+        v = self.victim
+        if v is None:
+            return None, None
+        if abs(v.bearing_deg) <= US_TRUST_BEARING_DEG:
+            d = self.sonar.front
+            if d is not None:
+                return d, "sonar"
+        if v.distance_m is not None:
+            return v.distance_m, "camera"
+        return None, None
+
     def step(self):
+        self.sonar.update()                    # one ping per tick, before deciding
         seen = self.vision.look()
 
         # Debounce both ways: a single frame should neither trigger an approach
@@ -380,14 +540,22 @@ class Nav:
         self.leds.green(False)
         if confirmed:
             self.leds.green(True)                      # green the moment we commit
-            if self.vision.geometry_ok:
+            if self.can_range:
                 self._enter(APPROACH)
             else:
-                # Refuse to drive at a victim we cannot range. Holding position with
-                # green lit is the honest behaviour; measure the camera constants.
+                # Refuse to drive at a victim we cannot range at all. Holding with
+                # green lit is the honest behaviour -- fit the front sonar, or
+                # measure the camera constants.
                 self.drive.stop()
             return
-        self.drive.set_velocity(0.0, SEARCH_TURN_RATE)  # spin and look
+        # Spinning on the spot can't run into anything, but if the front sonar says
+        # a wall is right there, don't let a later state drive into it unnoticed.
+        front = self.sonar.front
+        if front is not None and front < COLLISION_STOP_M:
+            self.blocked = True
+        else:
+            self.blocked = False
+        self.drive.set_velocity(0.0, SEARCH_TURN_RATE)  # spin on the spot and look
 
     def _approach(self, lost):
         if lost:
@@ -397,19 +565,25 @@ class Nav:
 
         v = self.victim
         self.leds.green(True)
-        if v.distance_m is None:                       # ranging dropped out mid-approach
-            self.drive.stop()
+
+        distance, source = self.victim_range()
+        # Steer on bearing regardless -- turning towards the victim is what brings it
+        # into the sonar cone. Vision reports +ve to the RIGHT; drive takes +ve as
+        # LEFT, so the sign flips here. This is the one place the two conventions meet.
+        w = max(-MAX_TURN_RATE, min(MAX_TURN_RATE, -HEADING_GAIN * v.bearing_deg))
+
+        if distance is None:
+            # Can't range it from here: rotate to centre it (which is what makes the
+            # sonar trustworthy) but don't close on an unknown distance.
+            self.drive.set_velocity(0.0, w)
             return
 
-        remaining = v.distance_m - STOP_DISTANCE_M
-        if remaining <= DISTANCE_TOLERANCE_M:
+        if distance - STOP_DISTANCE_M <= DISTANCE_TOLERANCE_M:
+            print(f"[nav] stopping at {distance*100:.1f} cm ({source})")
             self._enter(AT_VICTIM)
             return
 
-        # Steer on bearing. Vision reports +ve to the RIGHT; drive takes +ve as LEFT,
-        # so the sign flips here -- this is the one place the two conventions meet.
-        w = max(-MAX_TURN_RATE, min(MAX_TURN_RATE, -HEADING_GAIN * v.bearing_deg))
-        speed = CREEP_SPEED if v.distance_m < CREEP_RANGE_M else APPROACH_SPEED
+        speed = CREEP_SPEED if distance < CREEP_RANGE_M else APPROACH_SPEED
         self.drive.set_velocity(speed, w)
 
     def _at_victim(self):
@@ -426,21 +600,54 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__)
     ap.add_argument("--no-motors", action="store_true", help="run without driving")
+    ap.add_argument("--no-sonar", action="store_true", help="run without ultrasonics")
+    ap.add_argument("--sonar-test", action="store_true",
+                    help="print all three ranges continuously and exit on Ctrl-C")
     ap.add_argument("--placeholder-vision", action="store_true",
                     help="stand-in HSV detector instead of the real one")
     ap.add_argument("--check", action="store_true", help="wire up, report, exit")
     args = ap.parse_args()
 
+    # Bring-up aid: no camera, no motors, just the sensors. Use it to check wiring
+    # and that each sensor is where you think it is -- wave a hand in front of one.
+    if args.sonar_test:
+        sonar = Ultrasonics()
+        if not sonar.sensors:
+            raise SystemExit("no ultrasonics came up -- check ULTRASONIC_PINS wiring")
+        print("Ctrl-C to stop. Wave a hand in front of each sensor in turn.")
+        try:
+            while True:
+                sonar.update()
+                cells = []
+                for name in ("left", "front", "right"):
+                    d = sonar.get(name)
+                    cells.append(f"{name}: {'--- ' if d is None else f'{d*100:5.1f}'}cm")
+                print("  ".join(cells), end="\r", flush=True)
+                time.sleep(1.0 / CONTROL_HZ)
+        except KeyboardInterrupt:
+            print("\nstopped")
+        return
+
     leds = Leds()
     drive = Drive(enabled=not args.no_motors)
+    sonar = Ultrasonics(enabled=not args.no_sonar)
     vision = VictimVision(use_placeholder=args.placeholder_vision)
-    nav = Nav(drive, vision, leds)
+    nav = Nav(drive, vision, leds, sonar)
 
+    ranging = ("front sonar" if sonar.available else
+               "camera only" if vision.geometry_ok else "NONE -- approach disabled")
     print(f"\n[status] motors={'yes' if drive.board else 'NO'}  "
           f"leds={'GPIO' if leds.real else 'console'}  "
-          f"ranging={'yes' if vision.geometry_ok else 'NO -- approach disabled'}\n")
+          f"sonar={len(sonar.sensors)}/3  "
+          f"ranging={ranging}\n")
 
     if args.check:
+        for _ in range(12):                    # a few ticks so each sensor reports
+            sonar.update()
+            time.sleep(US_MIN_TRIGGER_GAP_S)
+        for name in ("left", "front", "right"):
+            d = sonar.get(name)
+            print(f"  sonar {name:>5}: {'no reading' if d is None else f'{d*100:.1f} cm'}")
         drive.stop()
         leds.all_off()
         vision.close()
