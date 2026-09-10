@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Navigation main loop -- demo behaviour: find a victim, stop 10 cm short, signal.
 
-    green LED  ON     while a victim is being tracked
-    yellow LED FLASH  once stopped within STOP_DISTANCE_M -- placeholder standing in
-                      for Roger's collection mechanism
+    green LED  ON     while a victim is being tracked, then while Roger's collector
+                      is deploying/cinching (rescue_collector.led_hint())
+    yellow LED FLASH  stopped within STOP_DISTANCE_M -- only used as a placeholder
+                      when rescue_collector.py isn't available (--no-rescue, or the
+                      module/hardware missing)
+    red LED    ON     while Roger's collector is stowing/holding a payload
 
     python3 main.py                      # full run, with the live camera window
     python3 main.py --no-motors          # everything except driving (motor HAT is dead)
+    python3 main.py --no-rescue          # skip the arm/spool, keep the yellow-flash placeholder
     python3 main.py --no-display         # headless / over SSH with no X
     python3 main.py --placeholder-vision # use the stand-in detector, NOT Kushal's
     python3 main.py --check              # wire everything up, report, exit
@@ -51,6 +55,11 @@ GREEN_LED_BCM = 16          # victim detected
 YELLOW_LED_BCM = 20         # collection placeholder
 RED_LED_BCM = 21            # returning to base -- wired, not yet driven by the FSM
 
+# Roger's rescue collector -- arm (positional servo) and spool (continuous servo).
+# See rescue_collector.py / rescue_arm.py / rescue_spool.py at the repo root.
+RESCUE_ARM_GPIO = 13
+RESCUE_SPOOL_GPIO = 12
+
 # Ultrasonics: (TRIG_BCM, ECHO_BCM). Front is the primary range to the victim;
 # left/right are for walls. All reachable through the HAT's passthrough pins.
 #
@@ -59,9 +68,10 @@ RED_LED_BCM = 21            # returning to base -- wired, not yet driven by the 
 # eventually damage the pin. TRIG is an input to the sensor and is fine direct.
 # Right was on (20, 21) until the LEDs claimed those; moved to (22, 27).
 # Full pin map -- keep these disjoint:
-#   I2C to the motor HAT   2, 3
-#   LEDs                   16 green, 20 yellow, 21 red
-#   ultrasonics            23/24 front, 5/6 left, 22/27 right
+#   I2C to the motor HAT     2, 3
+#   rescue collector         12 spool, 13 arm
+#   LEDs                     16 green, 20 yellow, 21 red
+#   ultrasonics               23/24 front, 5/6 left, 22/27 right
 ULTRASONIC_PINS = {
     "front": (23, 24),
     "left":  (5, 6),
@@ -651,6 +661,65 @@ class Drive:
             self.driver.close()
 
 
+# ===========================================================================
+# Rescue collector (Roger's arm + spool)
+# ===========================================================================
+class Rescue:
+    """Wraps RescueCollector so Nav has one call, following the same
+    degrade-gracefully pattern as Drive/Leds/VictimVision above: if
+    rescue_collector.py isn't importable, or the servos/hardware aren't
+    attached, the run still starts -- Nav just falls back to the old
+    yellow-flash placeholder in _at_victim().
+
+    This is the only place main.py talks to rescue_collector.py, mirroring how
+    Drive is the only place main.py talks to motors.py.
+    """
+
+    def __init__(self, enabled=True, arm_gpio=RESCUE_ARM_GPIO, spool_gpio=RESCUE_SPOOL_GPIO,
+                 disabled_reason="--no-rescue"):
+        self.collector = None
+        if not enabled:
+            STATUS.event(f"[rescue] disabled ({disabled_reason})")
+            return
+        try:
+            from rescue_collector import RescueCollector
+            self.collector = RescueCollector(arm_gpio=arm_gpio, spool_gpio=spool_gpio)
+            self.collector.park()
+            STATUS.event(f"[rescue] armed -- GPIO {arm_gpio} (arm) / {spool_gpio} (spool)")
+        except Exception as exc:                       # noqa: BLE001
+            STATUS.event(f"[rescue] NO COLLECTOR -- {type(exc).__name__}: {exc}\n"
+                         "          (rescue_collector.py not found, or hardware not "
+                         "attached). Falling back to the yellow-flash placeholder.")
+
+    @property
+    def available(self):
+        """Truthy when a real collector is armed -- what the status line reports on."""
+        return self.collector is not None
+
+    def start_collect(self):
+        return bool(self.collector) and self.collector.start_collect()
+
+    def led_hint(self):
+        """Collector's contribution to LED state, or None to leave LEDs alone."""
+        return self.collector.led_hint() if self.collector else None
+
+    @property
+    def has_payload(self):
+        return bool(self.collector) and self.collector.has_payload
+
+    @property
+    def failed(self):
+        return bool(self.collector) and self.collector.state.value == "failed"
+
+    @property
+    def error(self):
+        return self.collector.error if self.collector else None
+
+    def close(self):
+        if self.collector is not None:
+            self.collector.close()
+
+
 def heading_correction(bearing_deg, pivoting=False):
     """Yaw rate to put the victim on the nose, targeting HEADING_TOLERANCE_DEG.
 
@@ -880,9 +949,12 @@ SEARCH, APPROACH, CLOSING, AT_VICTIM, DONE = (
 
 
 class Nav:
-    def __init__(self, drive, vision, leds, sonar=None):
+    def __init__(self, drive, vision, leds, sonar=None, rescue=None):
         self.drive, self.vision, self.leds = drive, vision, leds
         self.sonar = sonar if sonar is not None else Ultrasonics(enabled=False)
+        # None (the test_nav.py / old-caller default) means "no collector wired
+        # up" -- same effect as Rescue(enabled=False), just without importing it.
+        self.rescue = rescue
         self.state = SEARCH
         self.hits = 0            # consecutive frames with a victim
         self.misses = 0          # consecutive frames without one
@@ -896,6 +968,7 @@ class Nav:
         self.heading_locked = False # committed to a heading; stop steering
         self.straight_ref = None    # encoder reading when this straight run began
         self.ticks = None           # latest cumulative encoder ticks
+        self._collect_started = False  # start_collect() called for this AT_VICTIM visit
 
     # -- transitions ------------------------------------------------------
     def _enter(self, state):
@@ -906,6 +979,7 @@ class Nav:
         if state == AT_VICTIM:
             self.arrived_at = time.monotonic()
             self.drive.stop()
+            self._collect_started = False
         if state == CLOSING:
             self.closing_since = time.monotonic()
             # Drop the stale detection: it's behind/underneath us now, and leaving it
@@ -1154,14 +1228,48 @@ class Nav:
         self.drive.set_velocity(CREEP_SPEED, 0.0)
 
     def _at_victim(self):
-        """Stopped 10 cm short. Flash yellow -- Roger's collection code goes here.
+        """Stopped 10 cm short. Hands off to Roger's collector if one is armed;
+        otherwise falls back to the yellow-flash placeholder.
 
-        Gives up after RESCUE_TIMEOUT_S. The real mechanism will report its own
-        success or failure; until it exists, a fixed timeout stands in for both so
-        the robot ends in a defined state instead of flashing forever.
+        Gives up after RESCUE_TIMEOUT_S either way -- the collector can also end
+        the wait early by reporting HOLDING (captured) or FAILED (jammed/timeout
+        inside its own state machine).
         """
         self.drive.stop()
         elapsed = time.monotonic() - self.arrived_at
+
+        if self.rescue is not None and self.rescue.available:
+            if not self._collect_started:
+                self._collect_started = self.rescue.start_collect()
+                if self._collect_started:
+                    STATUS.event("[nav] rescue collection started")
+
+            # non-blocking: start_collect() runs on the collector's own worker
+            # thread, so this just polls -- vision/sonar/display keep running
+            hint = self.rescue.led_hint()
+            if hint == "green":
+                self.leds.green(True)
+            elif hint == "red":
+                self.leds.green(False)
+                self.leds.red(True)
+            # hint is None while IDLE/RELEASING -- leave the LEDs as they are
+
+            if self.rescue.has_payload:
+                STATUS.event(f"[nav] victim captured in {elapsed:.1f}s")
+                self._enter(DONE)
+                return
+            if self.rescue.failed:
+                STATUS.event(f"[nav] rescue FAILED -- {self.rescue.error}")
+                self._enter(DONE)
+                return
+            if elapsed >= RESCUE_TIMEOUT_S:
+                STATUS.event(f"[nav] rescue timed out after {elapsed:.1f}s -- stopping")
+                self._enter(DONE)
+                return
+            return
+
+        # -- fallback: no collector armed (module missing, hardware absent, or
+        # --no-rescue) -- keep the original yellow-flash placeholder verbatim --
         if elapsed >= RESCUE_TIMEOUT_S:
             STATUS.event(f"[nav] rescue timed out after {elapsed:.1f}s -- stopping")
             self._enter(DONE)
@@ -1169,7 +1277,6 @@ class Nav:
         self.leds.green(True)
         phase = elapsed * YELLOW_FLASH_HZ
         self.leds.yellow(int(phase * 2) % 2 == 0)
-        # TODO: rescue.collect() -- replace the flash once the mechanism exists.
 
     def _done(self):
         """Terminal. Motors off, red LED solid, nothing else changes.
@@ -1188,6 +1295,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__)
     ap.add_argument("--no-motors", action="store_true", help="run without driving")
+    ap.add_argument("--no-rescue", action="store_true",
+                    help="run without the arm/spool -- keeps the yellow-flash placeholder")
     ap.add_argument("--no-sonar", action="store_true", help="run without ultrasonics")
     ap.add_argument("--sonar-test", action="store_true",
                     help="print all three ranges continuously and exit on Ctrl-C")
@@ -1228,6 +1337,13 @@ def main():
     STATUS.enabled = not args.no_status
     leds = Leds()
     drive = Drive(enabled=not args.no_motors)
+    # --check is a passive bring-up report; RescueCollector.park() physically snaps
+    # the arm servo on construction (see rescue_arm.py), so don't arm it here --
+    # use rescue_arm.py's own park/jog commands for arm bring-up instead.
+    rescue = Rescue(enabled=not args.no_rescue and not args.check,
+                     disabled_reason=("--check (arm stays put -- use rescue_arm.py "
+                                      "park/jog for bring-up)" if args.check else
+                                      "--no-rescue"))
     sonar = Ultrasonics(enabled=not args.no_sonar)
     blur = BLUR_THRESHOLD if args.blur_threshold is None else args.blur_threshold
     if not args.placeholder_vision:
@@ -1238,7 +1354,7 @@ def main():
         _vs.BLUR_VARIANCE_THRESHOLD = blur
     vision = VictimVision(use_placeholder=args.placeholder_vision)
     vision.blur_threshold = blur
-    nav = Nav(drive, vision, leds, sonar)
+    nav = Nav(drive, vision, leds, sonar, rescue)
     display = Display(enabled=not args.no_display)
 
     ranging = ("front sonar" if sonar.available else
@@ -1246,6 +1362,7 @@ def main():
     STATUS.event(f"[status] motors={'yes' if drive.board else 'NO'}  "
           f"leds={'GPIO' if leds.real else 'console'}  "
                  f"sonar={len(sonar.sensors)}/3  "
+                 f"rescue={'armed' if rescue.available else 'placeholder'}  "
                  f"ranging={ranging}")
 
     if args.check:
@@ -1257,6 +1374,7 @@ def main():
             print(f"  sonar {name:>5}: {'no reading' if d is None else f'{d*100:.1f} cm'}")
         drive.stop()
         leds.all_off()
+        rescue.close()
         vision.close()
         display.close()
         return
@@ -1288,6 +1406,7 @@ def main():
         STATUS.close()
         drive.stop()
         leds.all_off()
+        rescue.close()
         vision.close()
         display.close()
         print("stopped")
