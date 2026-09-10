@@ -105,8 +105,8 @@ COLLISION_STOP_M = 0.12     # front sonar closer than this while searching = wal
 WALL_NEAR_M = 0.20          # side sonar below this = wall alongside
 
 # --- exploring: drive straight, held straight by the encoders -----------------
-SEARCH_SPEED = 0.20         # m/s forward while exploring
-SEARCH_TURN_RATE = 2.0      # rad/s, spin rate when turning away from an obstacle
+SEARCH_SPEED = 0.13         # m/s forward while exploring
+SEARCH_TURN_RATE = 2.4      # rad/s, spin rate when turning away from an obstacle
 TURN_CLEAR_M = 0.35         # keep turning until the front is at least this clear
 
 # Correction per tick of left-minus-right difference. It acts on ACCUMULATED ticks,
@@ -118,9 +118,19 @@ MAX_STRAIGHT_CORRECTION = 1.0      # rad/s cap, so a big error can't spin the ro
 
 # --- approach: hold the victim within HEADING_TOLERANCE_DEG -------------------
 HEADING_TOLERANCE_DEG = 1.0   # aim to keep the victim inside this
-HEADING_COARSE_DEG = 5.0      # beyond this, turn on the spot instead of driving
-MIN_TURN_RATE = 0.55          # rad/s -- under this the tracks don't break stiction,
-                              # so a small correction would command nothing at all
+# Beyond this it pivots; inside it, it corrects while driving. Set wide deliberately:
+# correcting while rolling is both easier (no static friction to break) and smoother.
+# A pivot is effectively bang-bang once the friction floor kicks in -- at 2.2 rad/s
+# and 20 Hz it swings ~6 deg per tick -- so it needs plenty of margin to settle into,
+# or it would hunt either side of the threshold instead of converging.
+HEADING_COARSE_DEG = 20.0
+# Two different floors, because pivoting and correcting are different physics.
+# Stationary, a tracked chassis has to SKID both tracks sideways to rotate, and
+# static friction across the whole contact patch is what was stalling turns under
+# ~18 degrees -- the command was real, it just wasn't enough force. Already rolling,
+# the tracks are moving and a much gentler differential steers fine.
+MIN_TURN_RATE_PIVOT = 2.2     # rad/s floor when turning on the spot
+MIN_TURN_RATE_MOVING = 0.3    # rad/s floor while driving forward
 APPROACH_SPEED = 0.16       # m/s, closing speed once a victim is being tracked
 CREEP_SPEED = 0.09          # m/s, inside CREEP_RANGE_M -- slow enough to stop cleanly
 CREEP_RANGE_M = 0.25
@@ -591,7 +601,7 @@ class Drive:
             self.driver.close()
 
 
-def heading_correction(bearing_deg):
+def heading_correction(bearing_deg, pivoting=False):
     """Yaw rate to put the victim on the nose, targeting HEADING_TOLERANCE_DEG.
 
     Inside the tolerance the correction is exactly zero -- without that deadband a
@@ -607,7 +617,8 @@ def heading_correction(bearing_deg):
     """
     if abs(bearing_deg) <= HEADING_TOLERANCE_DEG:
         return 0.0
-    w = math.copysign(max(abs(HEADING_GAIN * bearing_deg), MIN_TURN_RATE), -bearing_deg)
+    floor = MIN_TURN_RATE_PIVOT if pivoting else MIN_TURN_RATE_MOVING
+    w = math.copysign(max(abs(HEADING_GAIN * bearing_deg), floor), -bearing_deg)
     return max(-MAX_TURN_RATE, min(MAX_TURN_RATE, w))
 
 
@@ -1002,12 +1013,11 @@ class Nav:
 
         self.aligned = abs(v.bearing_deg) <= CLOSING_ALIGN_DEG
         distance, source = self.victim_range()
-        w = heading_correction(v.bearing_deg)
 
         if distance is None:
             # Can't range it from here: rotate to centre it (which is what makes the
             # sonar trustworthy) but don't close on an unknown distance.
-            self.drive.set_velocity(0.0, w)
+            self.drive.set_velocity(0.0, heading_correction(v.bearing_deg, pivoting=True))
             return
 
         if distance - STOP_DISTANCE_M <= DISTANCE_TOLERANCE_M:
@@ -1019,11 +1029,11 @@ class Nav:
         # Past HEADING_COARSE_DEG, turn on the spot: driving on while badly off
         # heading travels further off course than the turn recovers.
         if abs(v.bearing_deg) > HEADING_COARSE_DEG:
-            self.drive.set_velocity(0.0, w)
+            self.drive.set_velocity(0.0, heading_correction(v.bearing_deg, pivoting=True))
             return
 
         speed = CREEP_SPEED if distance < CREEP_RANGE_M else APPROACH_SPEED
-        self.drive.set_velocity(speed, w)
+        self.drive.set_velocity(speed, heading_correction(v.bearing_deg))
 
     def _closing(self):
         """Final run-in with the victim out of frame. Straight ahead, sonar only.

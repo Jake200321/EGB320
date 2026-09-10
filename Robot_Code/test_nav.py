@@ -132,18 +132,34 @@ check("inside tolerance -> no correction, no hunting",
       M.heading_correction(M.HEADING_TOLERANCE_DEG) == 0.0)
 check("just outside tolerance -> it does correct",
       M.heading_correction(M.HEADING_TOLERANCE_DEG + 0.2) != 0.0)
-check("a small error still commands a real turn, not one the tracks ignore",
-      abs(M.heading_correction(2.0)) >= M.MIN_TURN_RATE)
+check("a small error while rolling still commands a real turn",
+      abs(M.heading_correction(2.0)) >= M.MIN_TURN_RATE_MOVING)
+check("a small error while STATIONARY gets enough to break track friction",
+      abs(M.heading_correction(2.0, pivoting=True)) >= M.MIN_TURN_RATE_PIVOT)
+check("the pivot floor is the bigger of the two",
+      M.MIN_TURN_RATE_PIVOT > M.MIN_TURN_RATE_MOVING)
 check("victim to the right -> turn right", M.heading_correction(10.0) < 0)
 check("victim to the left -> turn left", M.heading_correction(-10.0) > 0)
 check("capped at MAX_TURN_RATE", abs(M.heading_correction(180.0)) <= M.MAX_TURN_RATE)
+check("pivot floor is under the cap, or every turn would saturate",
+      M.MIN_TURN_RATE_PIVOT < M.MAX_TURN_RATE)
 check("symmetric", M.heading_correction(7.0) == -M.heading_correction(-7.0))
 
 print("2b) badly off heading, it turns on the spot rather than driving off course")
 d = FakeDrive()
-run(M.Nav(d, FakeVision([V(bearing=30.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
+run(M.Nav(d, FakeVision([V(bearing=35.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
 check("no forward motion while way off heading", d.last[0] == 0.0)
 check("turning towards it", d.last[1] < 0)
+check("hard enough to actually pivot", abs(d.last[1]) >= M.MIN_TURN_RATE_PIVOT)
+d = FakeDrive()
+run(M.Nav(d, FakeVision([V(bearing=15.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
+check("15 deg: outside the sonar's trust cone, so it pivots to centre first",
+      d.last[0] == 0.0 and abs(d.last[1]) >= M.MIN_TURN_RATE_PIVOT)
+d = FakeDrive()
+run(M.Nav(d, FakeVision([V(bearing=8.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
+check("8 deg: sonar believed, so it corrects while rolling",
+      d.last[0] > 0 and d.last[1] < 0)
+check("...and gently, not at the pivot floor", abs(d.last[1]) < M.MIN_TURN_RATE_PIVOT)
 d = FakeDrive()
 run(M.Nav(d, FakeVision([V(bearing=0.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
 check("lined up -> drives, no correction", d.last[0] > 0 and d.last[1] == 0.0)
@@ -339,11 +355,11 @@ check("standby is the reserved -128", MOT.MotorController.STANDBY == -128)
 import main as _N
 _fwd = MOT.to_raw(MOT.wheel_speeds(_N.SEARCH_SPEED, 0.0)[0])
 _spin = abs(MOT.to_raw(MOT.wheel_speeds(0.0, _N.SEARCH_TURN_RATE)[0]))
-_nudge = abs(MOT.to_raw(MOT.wheel_speeds(0.0, _N.MIN_TURN_RATE)[0]))
+_nudge = abs(MOT.to_raw(MOT.wheel_speeds(0.0, _N.MIN_TURN_RATE_PIVOT)[0]))
 check(f"explore drives hard ({_fwd}/127, want >=100)", _fwd >= 100)
 check(f"spin is decisive ({_spin}/127, want >=80)", _spin >= 80)
-check(f"the smallest heading nudge still moves ({_nudge}/127, want >MIN_SPEED_RAW)",
-      _nudge > MOT.MIN_SPEED_RAW)
+check(f"the smallest pivot still breaks track friction ({_nudge}/127, want >=100)",
+      _nudge >= 100)
 check("full board range is available", MOT.MAX_SPEED_RAW == 127)
 
 

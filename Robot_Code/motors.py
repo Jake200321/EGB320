@@ -64,7 +64,7 @@ RIGHT_SIGN = -1
 # A swap leaves straight driving looking perfect, because both channels get the same
 # command -- it only shows up the moment the robot tries to turn. It also inverts the
 # encoder straight-line correction, which then steers further off instead of back.
-SWAP_MOTORS = False
+SWAP_MOTORS = True
 # -------------------------------------------------------------------------------
 
 SPEED_LIMIT = 127                   # the board's hard limit
