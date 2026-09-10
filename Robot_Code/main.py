@@ -107,7 +107,7 @@ HORIZON_MARGIN_PX = 8       # slack for mounting tolerance and tilt error
 
 STOP_DISTANCE_M = 0.10      # stop this far short of the victim (assessment: 10 cm)
 DISTANCE_TOLERANCE_M = 0.02 # close enough -- stops hunting back and forth
-COLLISION_STOP_M = 0.12     # front sonar closer than this while searching = wall ahead
+COLLISION_STOP_M = 0.10     # front sonar closer than this while searching = wall ahead
 WALL_NEAR_M = 0.20          # side sonar below this = wall alongside
 
 # --- exploring: drive straight, held straight by the encoders -----------------
@@ -118,7 +118,24 @@ SEARCH_TURN_RATE = 2.4      # rad/s, spin rate when turning away from an obstacl
 # default -- it traverses any simply-connected maze, where alternating or random
 # turns can retrace the same ground.
 SEARCH_TURN_DIRECTION = -1
-TURN_CLEAR_M = 0.35         # keep turning until the front is at least this clear
+TURN_CLEAR_M = 0.35         # after a turn, this much clearance ahead counts as clear
+
+# ---- HOW FAR IT TURNS AT A WALL ----------------------------------------------
+# One tank turn lasts this long: both tracks counter-rotate at SEARCH_TURN_RATE,
+# so the angle is roughly SEARCH_TURN_RATE * TURN_DURATION_S radians.
+#
+#   0.65 s at 2.4 rad/s  ~  1.56 rad  ~  89 deg
+#
+# Roughly, because a tracked chassis has to skid to rotate and always under-turns
+# the commanded rate -- how much depends on floor grip, track tension and battery
+# voltage. Treat the figure as a starting point and adjust by watching it:
+#
+#   turns too far   -> lower TURN_DURATION_S
+#   not far enough  -> raise it
+#
+# After each turn it re-checks the front. Still blocked, it turns again -- so the
+# turn amount stays predictable while it's still guaranteed to end up clear.
+TURN_DURATION_S = 0.65
 
 # Correction per tick of left-minus-right difference. It acts on ACCUMULATED ticks,
 # not instantaneous speed, so it drives the total distance error to zero -- which is
@@ -875,6 +892,7 @@ class Nav:
         self._announced = False
         self.aligned = False        # was the victim well centred when last seen?
         self.closing_since = None
+        self.turn_started = None    # when the current tank turn began
         self.heading_locked = False # committed to a heading; stop steering
         self.straight_ref = None    # encoder reading when this straight run began
         self.ticks = None           # latest cumulative encoder ticks
@@ -1005,18 +1023,27 @@ class Nav:
         # Something ahead: turn on the spot until it's clear, then start a fresh
         # straight run. Hysteresis (in at COLLISION_STOP_M, out at TURN_CLEAR_M)
         # stops it dithering on the threshold.
+        turn = SEARCH_TURN_DIRECTION * SEARCH_TURN_RATE   # tank turn: tracks oppose
         if self.blocked:
+            if time.monotonic() - self.turn_started < TURN_DURATION_S:
+                self.drive.set_velocity(0.0, turn)            # mid-turn, keep going
+                return
+            # Turn finished. Clear ahead? If not, take another one -- keeps the turn
+            # amount predictable instead of spinning an arbitrary distance.
             if front is None or front >= TURN_CLEAR_M:
                 self.blocked = False
                 self.straight_ref = None       # new heading, new straight run
             else:
-                self.drive.set_velocity(0.0, SEARCH_TURN_DIRECTION * SEARCH_TURN_RATE)
+                self.turn_started = time.monotonic()
+                self.drive.set_velocity(0.0, turn)
                 return
         elif front is not None and front < COLLISION_STOP_M:
-            STATUS.event(f"[nav] wall at {front*100:.0f}cm -- turning")
+            STATUS.event(f"[nav] wall at {front*100:.0f}cm -- turning "
+                         f"{'right' if SEARCH_TURN_DIRECTION < 0 else 'left'}")
             self.blocked = True
+            self.turn_started = time.monotonic()
             self.straight_ref = None
-            self.drive.set_velocity(0.0, SEARCH_TURN_DIRECTION * SEARCH_TURN_RATE)
+            self.drive.set_velocity(0.0, turn)
             return
 
         self.drive.set_velocity(SEARCH_SPEED, self.straight_correction())

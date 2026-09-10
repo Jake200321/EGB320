@@ -15,6 +15,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import main as M
+import motors as MOT
 
 
 # --------------------------------------------------------------------- fakes
@@ -115,9 +116,27 @@ check("hard enough to pivot a tracked chassis", abs(d.last[1]) >= M.MIN_TURN_RAT
 son.front = 0.20                           # clearing, but not clear enough yet
 n.step()
 check("keeps turning below TURN_CLEAR_M", d.last[0] == 0.0)
+n.turn_started = time.monotonic() - (M.TURN_DURATION_S + 0.05)   # that turn finished
+n.step()
+check("still blocked after one turn -> takes another", d.last[0] == 0.0)
 son.front = 0.50                           # clear
+n.turn_started = time.monotonic() - (M.TURN_DURATION_S + 0.05)
 n.step(); n.step()
 check("resumes driving once clear", d.last[0] == M.SEARCH_SPEED)
+
+print("1d) the wall turn is a tank turn, and lasts TURN_DURATION_S")
+d, son = FakeDrive(ticks=(0, 0)), FakeSonar(front=1.0)
+n = M.Nav(d, FakeVision([None] * 30), FakeLeds(), son)
+n.step()
+son.front = 0.05
+n.step()
+_l, _r = MOT.wheel_speeds(*d.last)
+check("tracks counter-rotate (one forward, one back)", _l * _r < 0)
+check("no net forward motion", abs(_l + _r) < 1e-9)
+check("turning right", d.last[1] < 0)
+n.step(); n.step()
+check("holds the turn for the full duration", d.last[0] == 0.0)
+check("turn amount is time-based and adjustable", M.TURN_DURATION_S > 0)
 
 print("2) one frame doesn't commit; DETECTION_DEBOUNCE frames do")
 d, l = FakeDrive(), FakeLeds()
