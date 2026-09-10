@@ -34,7 +34,11 @@ REQUIRED_FIRMWARE = (1, 3)          # major must match, minor must be >= this
 # --- geometry / tuning ------------------------------------------------------
 TRACK_M = 0.123                     # Pololu 30T sprocket centre-to-centre
 SPROCKET_CIRCUM_M = math.pi * 0.024
-MAX_WHEEL_RPM = 200.0               # MEASURE -- output-shaft RPM at MAX_SPEED_RAW
+# Output-shaft RPM at MAX_SPEED_RAW. This is the scale every m/s command is measured
+# against, so setting it too HIGH makes the robot crawl: it thinks 0.10 m/s is a small
+# fraction of what it can do and sends a correspondingly small raw speed. 200 was the
+# 6 V no-load figure; under load on tracks it's nowhere near that. MEASURE.
+MAX_WHEEL_RPM = 130.0
 
 # ---- MOTOR DIRECTION -- change these if a track drives the wrong way ----------
 # Which way a POSITIVE raw speed turns each track. The motors sit facing opposite
@@ -52,8 +56,8 @@ RIGHT_SIGN = -1
 # -------------------------------------------------------------------------------
 
 SPEED_LIMIT = 127                   # the board's hard limit
-MAX_SPEED_RAW = 90                  # what "full speed" maps to (6 V motors)
-MIN_SPEED_RAW = 30                  # below this the geartrain stalls. MEASURE
+MAX_SPEED_RAW = 127                 # full board range -- this is the aggression knob
+MIN_SPEED_RAW = 45                  # below this the geartrain stalls. MEASURE
 
 BOARD_WATCHDOG_S = 0.5              # board cuts the motors after this with no command
 

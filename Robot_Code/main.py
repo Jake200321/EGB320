@@ -105,8 +105,8 @@ COLLISION_STOP_M = 0.12     # front sonar closer than this while searching = wal
 WALL_NEAR_M = 0.20          # side sonar below this = wall alongside
 
 # --- exploring: drive straight, held straight by the encoders -----------------
-SEARCH_SPEED = 0.10         # m/s forward while exploring
-SEARCH_TURN_RATE = 0.6      # rad/s, spin rate when turning away from an obstacle
+SEARCH_SPEED = 0.20         # m/s forward while exploring
+SEARCH_TURN_RATE = 2.0      # rad/s, spin rate when turning away from an obstacle
 TURN_CLEAR_M = 0.35         # keep turning until the front is at least this clear
 
 # Correction per tick of left-minus-right difference. It acts on ACCUMULATED ticks,
@@ -114,18 +114,18 @@ TURN_CLEAR_M = 0.35         # keep turning until the front is at least this clea
 # what "straight" means. Matching speeds alone would hold a constant heading error
 # forever. TUNE: too high oscillates, too low drifts.
 ENCODER_STRAIGHT_GAIN = 0.004      # rad/s per tick
-MAX_STRAIGHT_CORRECTION = 0.6      # rad/s cap, so a big error can't spin the robot
+MAX_STRAIGHT_CORRECTION = 1.0      # rad/s cap, so a big error can't spin the robot
 
 # --- approach: hold the victim within HEADING_TOLERANCE_DEG -------------------
 HEADING_TOLERANCE_DEG = 1.0   # aim to keep the victim inside this
 HEADING_COARSE_DEG = 5.0      # beyond this, turn on the spot instead of driving
-MIN_TURN_RATE = 0.25          # rad/s -- under this the tracks don't break stiction,
+MIN_TURN_RATE = 0.55          # rad/s -- under this the tracks don't break stiction,
                               # so a small correction would command nothing at all
-APPROACH_SPEED = 0.10       # m/s, closing speed once a victim is being tracked
-CREEP_SPEED = 0.05          # m/s, inside CREEP_RANGE_M -- slow enough to stop cleanly
+APPROACH_SPEED = 0.16       # m/s, closing speed once a victim is being tracked
+CREEP_SPEED = 0.09          # m/s, inside CREEP_RANGE_M -- slow enough to stop cleanly
 CREEP_RANGE_M = 0.25
-HEADING_GAIN = 0.03         # rad/s per degree of bearing error
-MAX_TURN_RATE = 1.2         # rad/s
+HEADING_GAIN = 0.07         # rad/s per degree of bearing error
+MAX_TURN_RATE = 2.5         # rad/s
 
 DETECTION_DEBOUNCE = 3      # consecutive frames before believing a detection
 LOST_GRACE_FRAMES = 8       # frames a victim may vanish for before we call it lost

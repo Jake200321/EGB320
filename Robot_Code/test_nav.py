@@ -334,6 +334,18 @@ check("encoder wraparound: 65535 -> 0 counts as +1", MOT._to_i16(0 - 65535) == 1
 check("...and reversing counts down", MOT._to_i16(65535 - 0) == -1)
 check("standby is the reserved -128", MOT.MotorController.STANDBY == -128)
 
+# Speeds must actually reach the board hard enough to move a tracked chassis. These
+# caught the robot barely moving: three separate limits were each throttling it.
+import main as _N
+_fwd = MOT.to_raw(MOT.wheel_speeds(_N.SEARCH_SPEED, 0.0)[0])
+_spin = abs(MOT.to_raw(MOT.wheel_speeds(0.0, _N.SEARCH_TURN_RATE)[0]))
+_nudge = abs(MOT.to_raw(MOT.wheel_speeds(0.0, _N.MIN_TURN_RATE)[0]))
+check(f"explore drives hard ({_fwd}/127, want >=100)", _fwd >= 100)
+check(f"spin is decisive ({_spin}/127, want >=80)", _spin >= 80)
+check(f"the smallest heading nudge still moves ({_nudge}/127, want >MIN_SPEED_RAW)",
+      _nudge > MOT.MIN_SPEED_RAW)
+check("full board range is available", MOT.MAX_SPEED_RAW == 127)
+
 # Motor direction: the sign flip must reach the board AND the odometry, or a
 # reversed motor drives right and counts backwards.
 class _FakeBoard:
