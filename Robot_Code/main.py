@@ -71,7 +71,7 @@ ULTRASONIC_PINS = {
 # sensor that isn't there costs a full echo timeout (~22 ms) every time its turn
 # comes round -- on a 50 ms control tick that is most of the budget, thrown away.
 # Add "left"/"right" back here once they're wired.
-SONARS_FITTED = ("front",)
+SONARS_FITTED = ("front", "right", "left")
 
 US_MAX_RANGE_M = 2.0        # ignore anything past this -- beyond the maze anyway
 US_MIN_TRIGGER_GAP_S = 0.06 # HC-SR04 wants >60 ms between pings; sensors are fired

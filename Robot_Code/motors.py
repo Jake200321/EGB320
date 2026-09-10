@@ -51,7 +51,7 @@ MAX_WHEEL_RPM = 130.0
 #
 # Find out with:  python3 motor_spin_test.py
 # Encoder counts are flipped by the same sign, so forward always counts up.
-LEFT_SIGN = -1
+LEFT_SIGN = 1
 RIGHT_SIGN = -1
 
 # Set True if the board's two channels are wired to the opposite tracks. Tell it
@@ -64,7 +64,7 @@ RIGHT_SIGN = -1
 # A swap leaves straight driving looking perfect, because both channels get the same
 # command -- it only shows up the moment the robot tries to turn. It also inverts the
 # encoder straight-line correction, which then steers further off instead of back.
-SWAP_MOTORS = True
+SWAP_MOTORS = False
 
 # ---- TRACK TRIM -- fix a robot that pulls to one side -------------------------
 # Per-track multipliers on every command. Raise one, or lower the other, until it
