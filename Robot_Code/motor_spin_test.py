@@ -5,10 +5,8 @@ Drives the unit's controller board (0x57 on i2c-8) through its own Controller cl
 from EGB320_Examples -- the same driver their motor_control_test.py uses, so if that
 works, this works.
 
-SETUP: controller.py isn't in this repo. Either copy it in --
-    cp -r ~/EGB320_Examples/motor_controller Robot_Code/
-or point at it:
-    export EGB320_EXAMPLES=~/EGB320_Examples
+controller.py is in the repo root (pushed with the rest of EGB320_Examples), so
+this needs no setup. Set EGB320_EXAMPLES if you keep it somewhere else.
 
 RUN IT -- ROBOT ON A BLOCK, TRACKS OFF THE GROUND:
     python3 motor_spin_test.py                # both motors, forward then reverse
@@ -23,8 +21,8 @@ WHAT YOU'RE CHECKING:
        LEFT_SIGN / RIGHT_SIGN below so positive means forward on both
     4. encoder ticks move, and which way they count
 
-set_raw_motor_speed()'s units aren't documented anywhere we have, so --speed is in
-whatever the board wants. Start low: these are 6 V motors.
+--speed is the board's raw motor speed, -127..127 (it rejects anything outside).
+The unit's own motor_control_test.py runs 100, so that's known good on this hardware.
 """
 
 import argparse
@@ -55,11 +53,13 @@ def connect(bus=I2C_BUS, addr=I2C_ADDR):
             f"  sudo i2cdetect -y {bus}      (expect {addr:02x} in the grid)\n"
             "  check the board is powered and seated"
         )
-    print(f"board OK at 0x{addr:02x} on i2c-{bus}")
+    fw = ".".join(map(str, board.get_firmware_version()))
+    print(f"board OK at 0x{addr:02x} on i2c-{bus}, firmware {fw}")
     return board
 
 
 def ticks(board):
+    """Same call the unit's own working test uses, so this measures what that does."""
     try:
         return board.get_encoder_ticks()
     except Exception:                              # noqa: BLE001
@@ -92,13 +92,18 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__)
-    ap.add_argument("--speed", type=int, default=40, help="raw speed magnitude")
+    ap.add_argument("--speed", type=int, default=100,
+                    help="raw speed magnitude, 1-127 (default 100, as the unit's "
+                         "own motor_control_test.py uses)")
     ap.add_argument("--seconds", type=float, default=2.0)
     ap.add_argument("--motor", choices=["left", "right"], default=None)
     ap.add_argument("--bus", type=int, default=I2C_BUS)
     ap.add_argument("--addr", type=lambda v: int(v, 0), default=I2C_ADDR)
     ap.add_argument("--whoami", action="store_true", help="check the board, then exit")
     args = ap.parse_args()
+
+    if not 1 <= args.speed <= 127:
+        raise SystemExit("--speed must be 1..127 -- the board rejects anything else")
 
     board = connect(args.bus, args.addr)
     if args.whoami:

@@ -210,6 +210,10 @@ check("stop maps to raw 0", MOT.to_raw(0.0) == 0)
 check("a creep still clears stiction", MOT.to_raw(0.004) >= MOT.MIN_SPEED_RAW)
 check("full speed is capped at MAX_SPEED_RAW",
       MOT.to_raw(99.0) == MOT.MAX_SPEED_RAW)
+check("never exceeds the board's -127..127, which controller.py rejects",
+      all(-127 <= MOT.to_raw(v) <= 127 for v in (-99, -1, -0.001, 0, 0.001, 1, 99)))
+check("controller.py is importable from where the examples live",
+      MOT.load_controller_class().I2C_ADDR == 0x57)
 check("reverse is negative", MOT.to_raw(-0.10) < 0)
 check("magnitude matches forward", abs(MOT.to_raw(-0.10)) == MOT.to_raw(0.10))
 check("board address is the unit's, not the DFRobot one",

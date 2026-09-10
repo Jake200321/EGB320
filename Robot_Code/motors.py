@@ -1,103 +1,121 @@
 #!/usr/bin/env python3
 """Motor driver -- wraps the unit's Controller board (0x57 on i2c-8).
 
-The board is the one EGB320_Examples/motor_controller/controller.py drives, NOT a
-DFRobot HAT. It speaks its own protocol (a WHO_AM_I register, set_raw_motor_speed,
-get_encoder_ticks), so this imports their Controller rather than reimplementing it --
-their driver is known-good on this hardware and guessing at register commands would
-be a slower way to get something worse.
+Built against the real controller.py (now in the repo root), not guessed at. The
+things that matter, from its own source:
 
-controller.py is not in this repo (EGB320_Examples ships separately), so we look for
-it in the usual places. Put a copy in Robot_Code/motor_controller/ to make this
-self-contained for the whole team.
+  set_raw_motor_speed(l, r)   -127..127, and it RAISES outside that range.
+                              None for both = standby. This is open loop, the
+                              board's PID is not involved.
+  set_motor_speed(l, r)       closed loop, ticks per 1/100 s, regulated by the
+                              board's PID. Better for driving straight -- not used
+                              yet, see the note at the bottom.
+  get_encoder_ticks()         "since the last time it was queried" -- a delta, and
+                              it overflows int16 if you don't poll often enough.
+  get_raw_encoder_ticks()     absolute uint16 with wraparound.
+  new_relative() /            wraparound-safe deltas. This is what we accumulate,
+  get_relative_encoder_ticks()  because it is unambiguous where the two above
+                              disagree with how the unit's own example uses them.
+  set_motor_shutdown_timeout(s)  the BOARD's own watchdog, 0.1-10 s. Used instead
+                              of a Python thread -- it keeps working even if this
+                              process dies, which is the case that matters.
 
-Everything above the I2C layer -- differential-drive kinematics, the duty cap, the
-watchdog -- lives here so nav never talks to the board directly.
+Everything above I2C -- differential-drive kinematics, the speed mapping, odometry
+accumulation -- lives here so nav never talks to the board directly.
 """
 
 import math
 import os
 import sys
-import threading
 import time
 
 # --- board / geometry -------------------------------------------------------
-I2C_ADDR = 0x57              # the unit's controller, confirmed working on the robot
-I2C_BUS = 8                  # /dev/i2c-8
+I2C_ADDR = 0x57
+I2C_BUS = 8
 
 TRACK_M = 0.123              # Pololu 30T sprocket centre-to-centre
 SPROCKET_CIRCUM_M = math.pi * 0.024
 MAX_WHEEL_RPM = 200.0        # MEASURE -- output-shaft RPM at MAX_SPEED_RAW
 
-# set_raw_motor_speed()'s units are NOT documented anywhere we have. This is the
-# magnitude sent for "full speed", and everything scales against it. Start low --
-# the N20s are 6 V motors -- and raise it once the bench test shows what actually
-# moves. If the board takes 0-100 this is 40%; if it takes 0-255 it's 16%.
-MAX_SPEED_RAW = 40
-MIN_SPEED_RAW = 12           # below this the geartrain won't break stiction. MEASURE
+# Raw speed is -127..127 (the board rejects anything outside). The unit's own
+# motor_control_test.py runs 100, so that's known to work on this hardware.
+SPEED_LIMIT = 127
+MAX_SPEED_RAW = 90           # what "full speed" maps to. 6 V motors -- keep headroom
+MIN_SPEED_RAW = 30           # below this the geartrain won't break stiction. MEASURE
 
-WATCHDOG_TIMEOUT_S = 0.5     # no command for this long -> stop. 0 disables.
+BOARD_WATCHDOG_S = 0.5       # board stops the motors if no command for this long
 
-_SEARCH_DIRS = [
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "motor_controller"),
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                 "motor_controller"),
-    os.path.expanduser("~/EGB320_Examples/motor_controller"),
-    "/home/egb320/EGB320_Examples/motor_controller",
-]
+
+def _candidate_dirs():
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = os.path.dirname(here)
+    env = os.environ.get("EGB320_EXAMPLES")
+    dirs = []
+    if env:
+        dirs += [env, os.path.join(env, "motor_controller")]
+    dirs += [
+        repo,                                        # where the examples were pushed
+        here,                                        # Robot_Code/
+        os.path.join(here, "motor_controller"),
+        os.path.join(repo, "motor_controller"),
+        os.path.expanduser("~/EGB320_Examples"),
+        os.path.expanduser("~/EGB320_Examples/motor_controller"),
+        "/home/egb320/EGB320_Examples/motor_controller",
+        os.getcwd(),
+    ]
+    seen, out = set(), []
+    for d in dirs:
+        if d and d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
 
 
 def load_controller_class():
-    """Import Controller from the unit's motor_controller package."""
-    env = os.environ.get("EGB320_EXAMPLES")
-    dirs = ([os.path.join(env, "motor_controller")] if env else []) + _SEARCH_DIRS
-
-    for d in dirs:
-        candidate = os.path.join(d, "controller.py")
-        if os.path.exists(candidate):
+    """Import Controller from wherever the unit's examples happen to live."""
+    for d in _candidate_dirs():
+        if os.path.exists(os.path.join(d, "controller.py")):
             if d not in sys.path:
                 sys.path.insert(0, d)
             from controller import Controller
             return Controller
-
     raise ImportError(
-        "controller.py not found. It comes with EGB320_Examples and isn't in this\n"
-        "repo. Either copy the folder in:\n"
-        "    cp -r ~/EGB320_Examples/motor_controller Robot_Code/\n"
-        "or point at it:\n"
-        "    export EGB320_EXAMPLES=~/EGB320_Examples\n"
-        f"Looked in: {', '.join(dirs)}"
+        "controller.py not found. It ships with EGB320_Examples.\n"
+        "Put it in the repo root or Robot_Code/, or set EGB320_EXAMPLES.\n"
+        "Looked in:\n  " + "\n  ".join(_candidate_dirs())
     )
 
 
 class MotorDriver:
-    """Differential drive on top of the unit's Controller.
+    """Differential drive on the unit's controller board.
 
     set_velocity(v, w) is all nav calls: v forward m/s, w yaw rad/s, POSITIVE = LEFT.
-
-    Watchdog: if set_velocity() isn't called for WATCHDOG_TIMEOUT_S the motors stop
-    themselves. A tracked robot whose control loop has died should not keep driving.
     """
 
     def __init__(self, bus=I2C_BUS, addr=I2C_ADDR, max_speed=MAX_SPEED_RAW):
         Controller = load_controller_class()
-        # Their Controller takes the bus and reads I2C_ADDR from its own class
-        # attribute, so the address is only overridable by setting it on the class.
-        if addr != getattr(Controller, "I2C_ADDR", addr):
+        if addr != Controller.I2C_ADDR:
             Controller.I2C_ADDR = addr
-        self.board = Controller(i2c_bus=bus)      # raises if WHO_AM_I disagrees
-        self.max_speed = max_speed
-        self.last = (0.0, 0.0)
-        self._last_cmd_t = time.monotonic()
-        self._moving = False
-        self._closed = False
-        print(f"[drive] unit controller at 0x{addr:02x} on i2c-{bus}, "
-              f"max raw speed {max_speed}")
+        # Raises WhoAmIMismatch or FirmwareVersionMismatch -- both worth surfacing
+        # as-is rather than swallowing; a wrong board should not look like no board.
+        self.board = Controller(i2c_bus=bus)
+        self.max_speed = min(abs(max_speed), SPEED_LIMIT)
+        self.last = (0, 0)
 
-        self._watchdog = None
-        if WATCHDOG_TIMEOUT_S > 0:
-            self._watchdog = threading.Thread(target=self._watchdog_loop, daemon=True)
-            self._watchdog.start()
+        # The board watchdog beats a Python one: it still fires if this process is
+        # killed, which is exactly when a robot running away matters most.
+        try:
+            self.board.set_motor_shutdown_timeout(BOARD_WATCHDOG_S)
+        except Exception as exc:                     # noqa: BLE001
+            print(f"[drive] could not set board watchdog: {exc}")
+
+        # Odometry: accumulate wraparound-safe deltas into a real running total.
+        self._relative = self.board.new_relative()
+        self.ticks = [0, 0]
+
+        print(f"[drive] unit controller 0x{addr:02x} on i2c-{bus}, "
+              f"firmware {'.'.join(map(str, self.board.get_firmware_version()))}, "
+              f"max raw speed {self.max_speed}")
 
     # -- commands ------------------------------------------------------------
     def set_velocity(self, v_mps, w_rps):
@@ -105,48 +123,49 @@ class MotorDriver:
         self.set_raw(to_raw(left, self.max_speed), to_raw(right, self.max_speed))
 
     def set_raw(self, left, right):
+        """Clamped to the board's -127..127 -- outside it, controller.py raises."""
+        left = max(-SPEED_LIMIT, min(SPEED_LIMIT, int(left)))
+        right = max(-SPEED_LIMIT, min(SPEED_LIMIT, int(right)))
         self.last = (left, right)
-        self._last_cmd_t = time.monotonic()
-        self._moving = bool(left or right)
-        self.board.set_raw_motor_speed(int(left), int(right))
+        self.board.set_raw_motor_speed(left, right)
 
     def stop(self):
         """Never raises -- called on every exit path."""
-        self.last = (0.0, 0.0)
-        self._moving = False
-        self._last_cmd_t = time.monotonic()
+        self.last = (0, 0)
         try:
             self.board.set_raw_motor_speed(0, 0)
-        except Exception as exc:                  # noqa: BLE001
+        except Exception as exc:                     # noqa: BLE001
             print(f"[drive] stop failed: {exc}")
 
     def close(self):
-        self._closed = True
         self.stop()
-
-    def _watchdog_loop(self):
-        tripped = False
-        while not self._closed:
-            time.sleep(WATCHDOG_TIMEOUT_S / 4.0)
-            idle = time.monotonic() - self._last_cmd_t
-            if idle > WATCHDOG_TIMEOUT_S and self._moving and not tripped:
-                print(f"[drive] WATCHDOG: no command for {idle:.2f}s -- stopping")
-                self.stop()
-                tripped = True
-            elif idle <= WATCHDOG_TIMEOUT_S:
-                tripped = False
+        try:
+            self.board.standby()
+        except Exception:                            # noqa: BLE001
+            pass
 
     # -- feedback ------------------------------------------------------------
     def read_encoders(self):
-        """(left, right) cumulative ticks, or None if the board won't answer.
+        """(left, right) cumulative ticks since this driver started, or None.
 
-        Real counts, not integrated from RPM -- this board has a tick register, which
-        the DFRobot one did not.
+        Accumulated from get_relative_encoder_ticks() rather than read straight from
+        get_encoder_ticks(): that one is documented as returning the count since the
+        last query, so treating it as an absolute total would silently produce
+        nonsense the moment anything else polled the board.
         """
         try:
-            return self.board.get_encoder_ticks()
-        except Exception as exc:                  # noqa: BLE001
+            dl, dr = self.board.get_relative_encoder_ticks(self._relative)
+        except Exception as exc:                     # noqa: BLE001
             print(f"[drive] encoder read failed: {exc}")
+            return None
+        self.ticks[0] += dl
+        self.ticks[1] += dr
+        return tuple(self.ticks)
+
+    def status(self):
+        try:
+            return self.board.get_status()
+        except Exception:                            # noqa: BLE001
             return None
 
 
@@ -159,11 +178,11 @@ def wheel_speeds(v_mps, w_rps, track_m=TRACK_M):
 
 def to_raw(wheel_mps, max_speed=MAX_SPEED_RAW, max_wheel_rpm=MAX_WHEEL_RPM,
            min_speed=MIN_SPEED_RAW):
-    """Wheel speed in m/s -> the signed number set_raw_motor_speed() wants.
+    """Wheel speed in m/s -> the signed -127..127 the board wants.
 
-    Deadband-compensated: anything under ~1% of full scale is a stop, everything else
-    lands in [min_speed, max_speed], because a value below min_speed just stalls the
-    geartrain and heats the motor instead of turning it.
+    Deadband-compensated: under ~1% of full scale is a stop, everything else lands in
+    [min_speed, max_speed], because a value below min_speed stalls the geartrain and
+    heats the motor rather than turning it.
     """
     max_mps = max_wheel_rpm / 60.0 * SPROCKET_CIRCUM_M
     if max_mps <= 0:
@@ -172,4 +191,12 @@ def to_raw(wheel_mps, max_speed=MAX_SPEED_RAW, max_wheel_rpm=MAX_WHEEL_RPM,
     if frac < 0.01:
         return 0
     frac = min(frac, 1.0)
-    return int(math.copysign(min_speed + frac * (max_speed - min_speed), wheel_mps))
+    raw = min_speed + frac * (max_speed - min_speed)
+    return int(math.copysign(min(raw, SPEED_LIMIT), wheel_mps))
+
+
+# NOTE for later: the board also does closed-loop speed via set_motor_speed(), in
+# ticks per 1/100 s, regulated by its own PID (tunable with set_pid_coefficients).
+# That would hold a straight line far better than open-loop raw PWM, which drifts
+# whenever the two motors differ. Worth moving to once MAX_WHEEL_RPM is measured and
+# there's a tick-per-metre figure to convert against.
