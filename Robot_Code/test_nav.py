@@ -164,15 +164,51 @@ d = FakeDrive()
 run(M.Nav(d, FakeVision([V(bearing=0.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
 check("lined up -> drives, no correction", d.last[0] > 0 and d.last[1] == 0.0)
 
+print("2c) heading locks inside HEADING_LOCK_DEG and then drives straight")
+d, l = FakeDrive(), FakeLeds()
+n = M.Nav(d, FakeVision([V(bearing=3.0)] * 8), l, FakeSonar(front=0.5))
+run(n, 6)
+check("locked once inside the lock angle", n.heading_locked is True)
+check("stops steering entirely", d.last[1] == 0.0)
+check("still driving forward", d.last[0] > 0)
+
+print("2c-ii) noise inside the unlock band does NOT break the lock")
+for noisy in (4.0, -4.0, 9.0, -12.0, 14.0):
+    n.vision.script = [V(bearing=noisy)] * 3
+    run(n, 3)
+    check(f"{noisy:+5.1f} deg wobble keeps the lock", n.heading_locked is True)
+    check(f"...and keeps driving straight", d.last[1] == 0.0)
+
+print("2c-iii) a real drift past HEADING_UNLOCK_DEG does break it")
+n.vision.script = [V(bearing=25.0)] * 4
+run(n, 4)
+check("unlocked", n.heading_locked is False)
+check("steering again", d.last[1] != 0.0)
+
+print("2c-iv) the lock is dropped when the approach restarts")
+d2, l2 = FakeDrive(), FakeLeds()
+n2 = M.Nav(d2, FakeVision([V()] * 4 + [None] * 20 + [V()] * 6), l2, FakeSonar(front=0.9))
+run(n2, 5)
+check("locked during the first approach", n2.heading_locked is True)
+run(n2, 20)
+check("victim lost -> SEARCH", n2.state == M.SEARCH)
+check("lock cleared", n2.heading_locked is False)
+
+print("2d) entering an approach must not clear the LEDs")
+d3, l3 = FakeDrive(), FakeLeds()
+n3 = M.Nav(d3, FakeVision([V()] * 6), l3, FakeSonar(front=0.5))
+run(n3, 5)
+check("green stays on through the SEARCH -> APPROACH transition", l3.g is True)
+
 print("3) approach steers the right way (+bearing = right = negative yaw)")
 # Bearing inside HEADING_COARSE_DEG so it drives while correcting (2b covers the
 # turn-on-the-spot case) and inside US_TRUST_BEARING_DEG so the sonar is believed.
 d = FakeDrive()
-run(M.Nav(d, FakeVision([V(bearing=3.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
+run(M.Nav(d, FakeVision([V(bearing=8.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
 check("driving forward", d.last[0] > 0)
 check("yaw negative for a victim to the right", d.last[1] < 0)
 d = FakeDrive()
-run(M.Nav(d, FakeVision([V(bearing=-3.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
+run(M.Nav(d, FakeVision([V(bearing=-8.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
 check("yaw positive for a victim to the left", d.last[1] > 0)
 
 print("4) creeps when close")

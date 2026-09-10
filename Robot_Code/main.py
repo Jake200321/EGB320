@@ -124,6 +124,16 @@ HEADING_TOLERANCE_DEG = 1.0   # aim to keep the victim inside this
 # and 20 Hz it swings ~6 deg per tick -- so it needs plenty of margin to settle into,
 # or it would hunt either side of the threshold instead of converging.
 HEADING_COARSE_DEG = 20.0
+
+# Heading lock. Once the victim is inside HEADING_LOCK_DEG the heading is committed
+# and steering stops -- from there it drives straight. Bearings get noisy close in
+# (the victim fills the frame, the bbox centre wanders), and chasing that noise
+# steers the robot off a line that was already good enough.
+#
+# It only unlocks if the bearing drifts past HEADING_UNLOCK_DEG, which is well
+# outside the noise: locking and unlocking on the same threshold would chatter.
+HEADING_LOCK_DEG = 5.0
+HEADING_UNLOCK_DEG = 15.0
 # Two different floors, because pivoting and correcting are different physics.
 # Stationary, a tracked chassis has to SKID both tracks sideways to rotate, and
 # static friction across the whole contact patch is what was stalling turns under
@@ -236,7 +246,8 @@ def status_text(nav, sonar, leds, hz):
     else:
         distance, source = nav.victim_range()
         rng = "range unknown" if distance is None else f"{distance*100:5.1f}cm ({source})"
-        target = f"victim: {v.bearing_deg:+6.1f}deg  {rng}"
+        lock = " LOCK" if getattr(nav, "heading_locked", False) else "     "
+        target = f"victim: {v.bearing_deg:+6.1f}deg{lock} {rng}"
 
     def cm(name):
         d = sonar.get(name)
@@ -372,6 +383,8 @@ def render_hud(frame, detections, nav, sonar, draw_detections=None):
                "blobs: " + "  ".join(f"{k} x{v}" for k, v in sorted(counts.items())))
         txt += f"   victim kept {getattr(vision,'n_victim_kept',0)}" \
                f"/{getattr(vision,'n_victim_raw',0)}"
+        if getattr(nav, "heading_locked", False):
+            txt += "   HEADING LOCKED"
         cv2.putText(img, txt, (8, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                     (220, 220, 220), 1)
 
@@ -842,6 +855,7 @@ class Nav:
         self._announced = False
         self.aligned = False        # was the victim well centred when last seen?
         self.closing_since = None
+        self.heading_locked = False # committed to a heading; stop steering
         self.straight_ref = None    # encoder reading when this straight run began
         self.ticks = None           # latest cumulative encoder ticks
 
@@ -870,10 +884,13 @@ class Nav:
         if state == SEARCH:
             self._announced = False
             self.aligned = False
+            self.heading_locked = False
             self.straight_ref = None
             self.leds.green(False)
             self.leds.yellow(False)
             self.leds.red(False)
+        if state == APPROACH:
+            self.heading_locked = False
 
     @property
     def can_range(self):
@@ -897,6 +914,16 @@ class Nav:
         v = self.victim
         if v is None:
             return None, None
+
+        # A locked heading is an assertion that we are pointed at the victim, so the
+        # front sonar is ranging it whatever the bearing currently reads. Without
+        # this, a noisy bearing past US_TRUST_BEARING_DEG would drop the range and
+        # send it pivoting -- exactly the behaviour the lock exists to stop.
+        if self.heading_locked:
+            d = self.sonar.front
+            if d is not None:
+                return d, "sonar"
+
         if abs(v.bearing_deg) <= US_TRUST_BEARING_DEG:
             d = self.sonar.front
             if d is not None:
@@ -1012,6 +1039,7 @@ class Nav:
         self.leds.green(True)
 
         self.aligned = abs(v.bearing_deg) <= CLOSING_ALIGN_DEG
+        self.update_heading_lock(v.bearing_deg)
         distance, source = self.victim_range()
 
         if distance is None:
@@ -1028,12 +1056,26 @@ class Nav:
 
         # Past HEADING_COARSE_DEG, turn on the spot: driving on while badly off
         # heading travels further off course than the turn recovers.
-        if abs(v.bearing_deg) > HEADING_COARSE_DEG:
+        if not self.heading_locked and abs(v.bearing_deg) > HEADING_COARSE_DEG:
             self.drive.set_velocity(0.0, heading_correction(v.bearing_deg, pivoting=True))
             return
 
+        # Locked: drive dead straight and ignore the bearing entirely.
+        w = 0.0 if self.heading_locked else heading_correction(v.bearing_deg)
         speed = CREEP_SPEED if distance < CREEP_RANGE_M else APPROACH_SPEED
-        self.drive.set_velocity(speed, heading_correction(v.bearing_deg))
+        self.drive.set_velocity(speed, w)
+
+    def update_heading_lock(self, bearing_deg):
+        """Latch the heading once we're lined up; only let go if it really drifts."""
+        if self.heading_locked:
+            if abs(bearing_deg) > HEADING_UNLOCK_DEG:
+                STATUS.event(f"[nav] heading unlocked -- victim drifted to "
+                             f"{bearing_deg:+.1f} deg")
+                self.heading_locked = False
+        elif abs(bearing_deg) <= HEADING_LOCK_DEG:
+            STATUS.event(f"[nav] heading LOCKED at {bearing_deg:+.1f} deg -- "
+                         "driving straight from here")
+            self.heading_locked = True
 
     def _closing(self):
         """Final run-in with the victim out of frame. Straight ahead, sonar only.
