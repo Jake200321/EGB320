@@ -1,28 +1,24 @@
 #!/usr/bin/env python3
 """STEP ONE: make the motors turn, and find out which way is forward.
 
-Drives the unit's controller board (0x57 on i2c-8) through its own Controller class
-from EGB320_Examples -- the same driver their motor_control_test.py uses, so if that
-works, this works.
+Talks to the controller board (0x57 on i2c-8) through motors.py, which speaks the
+board's I2C protocol directly -- no dependency on the EGB320_Examples files.
 
-controller.py is in the repo root (pushed with the rest of EGB320_Examples), so
-this needs no setup. Set EGB320_EXAMPLES if you keep it somewhere else.
+    ROBOT ON A BLOCK. Tracks off the ground.
 
-RUN IT -- ROBOT ON A BLOCK, TRACKS OFF THE GROUND:
-    python3 motor_spin_test.py                # both motors, forward then reverse
-    python3 motor_spin_test.py --speed 60     # harder, if it doesn't break stiction
-    python3 motor_spin_test.py --motor left   # one side only
-    python3 motor_spin_test.py --whoami       # just check the board answers, then exit
+    python3 motor_spin_test.py               # each track forward, then reverse
+    python3 motor_spin_test.py --speed 60    # gentler
+    python3 motor_spin_test.py --motor left  # one side only
+    python3 motor_spin_test.py --whoami      # identify the board, then exit
 
 WHAT YOU'RE CHECKING:
-    1. board answers WHO_AM_I           -> if not: i2cdetect -y 8, expect 57
-    2. each motor turns on its own      -> if not: raise --speed, check leads/battery
-    3. which direction a POSITIVE speed drives each track  -> write it down, then set
-       LEFT_SIGN / RIGHT_SIGN below so positive means forward on both
-    4. encoder ticks move, and which way they count
+    1. the board answers WHO_AM_I     -> if not: sudo i2cdetect -y 8, expect 57
+    2. each track turns on its own    -> if not: raise --speed, check leads/battery
+    3. which way a POSITIVE speed drives each track -> write it down, then set
+       LEFT_SIGN / RIGHT_SIGN in motors.py so positive means forward on both
+    4. encoder ticks move, and count up when the track drives forward
 
---speed is the board's raw motor speed, -127..127 (it rejects anything outside).
-The unit's own motor_control_test.py runs 100, so that's known good on this hardware.
+--speed is the board's raw motor speed, 1-127.
 """
 
 import argparse
@@ -32,103 +28,84 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from motors import I2C_ADDR, I2C_BUS, load_controller_class   # noqa: E402
-
-# Flip these once you know which way each track actually drives. The motors face
-# opposite ways on the chassis, so one side almost certainly needs -1.
-LEFT_SIGN = 1
-RIGHT_SIGN = 1
+from motors import I2C_ADDR, I2C_BUS, MotorController   # noqa: E402
 
 
-def connect(bus=I2C_BUS, addr=I2C_ADDR):
-    Controller = load_controller_class()
-    if addr != getattr(Controller, "I2C_ADDR", addr):
-        Controller.I2C_ADDR = addr
+def connect(bus, addr):
     try:
-        board = Controller(i2c_bus=bus)
+        board = MotorController(bus, addr)
     except Exception as exc:                       # noqa: BLE001
         raise SystemExit(
-            f"controller did not come up on i2c-{bus} at 0x{addr:02x} -- "
+            f"board did not come up on i2c-{bus} at {addr:#04x} -- "
             f"{type(exc).__name__}: {exc}\n"
-            f"  sudo i2cdetect -y {bus}      (expect {addr:02x} in the grid)\n"
-            "  check the board is powered and seated"
-        )
+            f"  sudo i2cdetect -y {bus}     (expect {addr:02x} in the grid)\n"
+            "  check the board is powered and seated")
     fw = ".".join(map(str, board.get_firmware_version()))
-    print(f"board OK at 0x{addr:02x} on i2c-{bus}, firmware {fw}")
+    print(f"board OK at {addr:#04x} on i2c-{bus}, firmware {fw}")
     return board
-
-
-def ticks(board):
-    """Same call the unit's own working test uses, so this measures what that does."""
-    try:
-        return board.get_encoder_ticks()
-    except Exception:                              # noqa: BLE001
-        return None
 
 
 def run(board, left, right, seconds, label):
     print(f"\n>>> {label}: left={left:+d} right={right:+d} for {seconds:.1f}s")
-    before = ticks(board)
-    board.set_raw_motor_speed(int(left), int(right))
+    before = board.get_raw_encoder_ticks()
+    board.set_raw_motor_speed(left, right)
     deadline = time.time() + seconds
     while time.time() < deadline:
         time.sleep(0.25)
-        t = ticks(board)
-        if t is not None:
-            print(f"      encoder ticks: {t}")
+        print(f"      raw encoder counters: {board.get_raw_encoder_ticks()}")
     board.set_raw_motor_speed(0, 0)
     time.sleep(0.4)
 
-    after = ticks(board)
-    if before is not None and after is not None:
-        moved = tuple(a - b for a, b in zip(after, before))
-        print(f"      moved {moved} ticks")
-        if moved == (0, 0):
-            print("      !! nothing moved -- raise --speed, or check leads and battery")
-    return after
+    from motors import _to_i16
+    after = board.get_raw_encoder_ticks()
+    moved = tuple(_to_i16(a - b) for a, b in zip(after, before))
+    print(f"      moved {moved} ticks  (left, right)")
+    if moved == (0, 0):
+        print("      !! nothing moved -- raise --speed, or check leads and battery")
+    return moved
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__)
-    ap.add_argument("--speed", type=int, default=100,
-                    help="raw speed magnitude, 1-127 (default 100, as the unit's "
-                         "own motor_control_test.py uses)")
+    ap.add_argument("--speed", type=int, default=100, help="raw speed, 1-127")
     ap.add_argument("--seconds", type=float, default=2.0)
     ap.add_argument("--motor", choices=["left", "right"], default=None)
     ap.add_argument("--bus", type=int, default=I2C_BUS)
     ap.add_argument("--addr", type=lambda v: int(v, 0), default=I2C_ADDR)
-    ap.add_argument("--whoami", action="store_true", help="check the board, then exit")
+    ap.add_argument("--whoami", action="store_true")
     args = ap.parse_args()
 
     if not 1 <= args.speed <= 127:
-        raise SystemExit("--speed must be 1..127 -- the board rejects anything else")
+        raise SystemExit("--speed must be 1..127")
 
     board = connect(args.bus, args.addr)
     if args.whoami:
-        print("ticks:", ticks(board))
+        print(f"who_am_i: {board.who_am_i():#04x}")
+        print(f"status:   {board.get_status()}")
+        print(f"encoders: {board.get_raw_encoder_ticks()}")
         return
 
     s = args.speed
     try:
         if args.motor in (None, "left"):
-            run(board, LEFT_SIGN * s, 0, args.seconds, "LEFT track, positive")
-            run(board, -LEFT_SIGN * s, 0, args.seconds, "LEFT track, negative")
-            print("    -> which drove the LEFT track FORWARD? set LEFT_SIGN accordingly.")
+            run(board, s, 0, args.seconds, "LEFT track, positive speed")
+            run(board, -s, 0, args.seconds, "LEFT track, negative speed")
+            print("    -> which drove the LEFT track FORWARD? Set LEFT_SIGN in motors.py.")
         if args.motor in (None, "right"):
-            run(board, 0, RIGHT_SIGN * s, args.seconds, "RIGHT track, positive")
-            run(board, 0, -RIGHT_SIGN * s, args.seconds, "RIGHT track, negative")
+            run(board, 0, s, args.seconds, "RIGHT track, positive speed")
+            run(board, 0, -s, args.seconds, "RIGHT track, negative speed")
             print("    -> same for RIGHT_SIGN.")
         if args.motor is None:
-            run(board, LEFT_SIGN * s, RIGHT_SIGN * s, args.seconds,
-                "BOTH forward (should drive straight, not spin)")
+            run(board, s, s, args.seconds, "BOTH positive (straight, not a spin?)")
         print("\nDone.")
     except KeyboardInterrupt:
         print("\ninterrupted")
     finally:
         try:
             board.set_raw_motor_speed(0, 0)
+            board.standby()
         except Exception:                          # noqa: BLE001
             pass
 

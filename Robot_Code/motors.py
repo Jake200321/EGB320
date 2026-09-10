@@ -1,120 +1,174 @@
 #!/usr/bin/env python3
-"""Motor driver -- wraps the unit's Controller board (0x57 on i2c-8).
+"""Motor control for the EGB320 controller board (0x57 on i2c-8). Self-contained.
 
-Built against the real controller.py (now in the repo root), not guessed at. The
-things that matter, from its own source:
+Speaks the board's I2C protocol directly -- nothing here imports from
+EGB320_Examples, so the nav system has no dependency on files that ship separately
+and could move or change underneath it. The register map and packing below were
+taken from the unit's controller.py, which is the authority on this hardware; only
+the commands nav actually needs are implemented.
 
-  set_raw_motor_speed(l, r)   -127..127, and it RAISES outside that range.
-                              None for both = standby. This is open loop, the
-                              board's PID is not involved.
-  set_motor_speed(l, r)       closed loop, ticks per 1/100 s, regulated by the
-                              board's PID. Better for driving straight -- not used
-                              yet, see the note at the bottom.
-  get_encoder_ticks()         "since the last time it was queried" -- a delta, and
-                              it overflows int16 if you don't poll often enough.
-  get_raw_encoder_ticks()     absolute uint16 with wraparound.
-  new_relative() /            wraparound-safe deltas. This is what we accumulate,
-  get_relative_encoder_ticks()  because it is unambiguous where the two above
-                              disagree with how the unit's own example uses them.
-  set_motor_shutdown_timeout(s)  the BOARD's own watchdog, 0.1-10 s. Used instead
-                              of a Python thread -- it keeps working even if this
-                              process dies, which is the case that matters.
+    MotorController   the wire protocol: WHO_AM_I, firmware, raw speed, encoders,
+                      the board's own shutdown watchdog
+    MotorDriver       what nav uses: set_velocity(v, w) in m/s and rad/s, plus
+                      accumulated odometry
 
-Everything above I2C -- differential-drive kinematics, the speed mapping, odometry
-accumulation -- lives here so nav never talks to the board directly.
+Two things about this board worth knowing:
+
+  * Raw motor speed is -127..127. 127 and -128 are reserved: -128 written to both
+    motors means standby. Values are clamped here rather than sent blind.
+  * The board has its own motor shutdown timeout. That's a better watchdog than
+    anything in Python, because it still fires when this process dies -- which is
+    exactly when a robot driving away matters.
 """
 
 import math
-import os
-import sys
+import struct
 import time
 
-# --- board / geometry -------------------------------------------------------
+
+# --- board ------------------------------------------------------------------
 I2C_ADDR = 0x57
 I2C_BUS = 8
+REQUIRED_FIRMWARE = (1, 3)          # major must match, minor must be >= this
 
-TRACK_M = 0.123              # Pololu 30T sprocket centre-to-centre
+# --- geometry / tuning ------------------------------------------------------
+TRACK_M = 0.123                     # Pololu 30T sprocket centre-to-centre
 SPROCKET_CIRCUM_M = math.pi * 0.024
-MAX_WHEEL_RPM = 200.0        # MEASURE -- output-shaft RPM at MAX_SPEED_RAW
+MAX_WHEEL_RPM = 200.0               # MEASURE -- output-shaft RPM at MAX_SPEED_RAW
 
-# Raw speed is -127..127 (the board rejects anything outside). The unit's own
-# motor_control_test.py runs 100, so that's known to work on this hardware.
-SPEED_LIMIT = 127
-MAX_SPEED_RAW = 90           # what "full speed" maps to. 6 V motors -- keep headroom
-MIN_SPEED_RAW = 30           # below this the geartrain won't break stiction. MEASURE
+SPEED_LIMIT = 127                   # the board's hard limit
+MAX_SPEED_RAW = 90                  # what "full speed" maps to (6 V motors)
+MIN_SPEED_RAW = 30                  # below this the geartrain stalls. MEASURE
 
-BOARD_WATCHDOG_S = 0.5       # board stops the motors if no command for this long
+BOARD_WATCHDOG_S = 0.5              # board cuts the motors after this with no command
 
 
-def _candidate_dirs():
-    here = os.path.dirname(os.path.abspath(__file__))
-    repo = os.path.dirname(here)
-    env = os.environ.get("EGB320_EXAMPLES")
-    dirs = []
-    if env:
-        dirs += [env, os.path.join(env, "motor_controller")]
-    dirs += [
-        repo,                                        # where the examples were pushed
-        here,                                        # Robot_Code/
-        os.path.join(here, "motor_controller"),
-        os.path.join(repo, "motor_controller"),
-        os.path.expanduser("~/EGB320_Examples"),
-        os.path.expanduser("~/EGB320_Examples/motor_controller"),
-        "/home/egb320/EGB320_Examples/motor_controller",
-        os.getcwd(),
-    ]
-    seen, out = set(), []
-    for d in dirs:
-        if d and d not in seen:
-            seen.add(d)
-            out.append(d)
-    return out
+class WhoAmIMismatch(Exception):
+    """Something answered at 0x57, but it isn't this board."""
 
 
-def load_controller_class():
-    """Import Controller from wherever the unit's examples happen to live."""
-    for d in _candidate_dirs():
-        if os.path.exists(os.path.join(d, "controller.py")):
-            if d not in sys.path:
-                sys.path.insert(0, d)
-            from controller import Controller
-            return Controller
-    raise ImportError(
-        "controller.py not found. It ships with EGB320_Examples.\n"
-        "Put it in the repo root or Robot_Code/, or set EGB320_EXAMPLES.\n"
-        "Looked in:\n  " + "\n  ".join(_candidate_dirs())
-    )
+class FirmwareVersionMismatch(Exception):
+    """The board is running firmware this protocol doesn't match."""
+
+
+def _to_i16(v):
+    """Reinterpret a uint16 as int16 -- how encoder wraparound is made sane."""
+    v &= 0xFFFF
+    return v - 0x10000 if v & 0x8000 else v
+
+
+class MotorController:
+    """The board's I2C protocol. Only what nav needs."""
+
+    CMD_FIRMWARE_VERSION = 0x08
+    CMD_WHO_AM_I = 0x0F
+    CMD_MOTOR_SHUTDOWN_TIMEOUT = 0x28
+    CMD_RAW_MOTOR_SPEED = 0x30
+    CMD_ENCODER_TICKS = 0x32
+    CMD_RAW_ENCODER_TICKS = 0x33
+    CMD_STATUS = 0x36
+
+    STANDBY = -128                  # written to both motors = standby
+
+    def __init__(self, bus=I2C_BUS, addr=I2C_ADDR, check=True):
+        self.addr = addr
+        self.bus_num = bus
+        # python3-smbus on Pi OS; smbus2 is a drop-in and is what pip installs.
+        try:
+            import smbus
+        except ImportError:
+            try:
+                import smbus2 as smbus
+            except ImportError as exc:
+                raise ImportError(
+                    "no smbus module -- install one of:\n"
+                    "    sudo apt install python3-smbus\n"
+                    "    pip install smbus2"
+                ) from exc
+        self.i2c = smbus.SMBus(bus)
+        if check:
+            self.check_who_am_i()
+            self.check_firmware_version()
+
+    # -- wire ----------------------------------------------------------------
+    def _read(self, command, n, spec):
+        return struct.unpack(spec, bytes(self.i2c.read_i2c_block_data(self.addr, command, n)))
+
+    def _write(self, command, data):
+        self.i2c.write_i2c_block_data(self.addr, command, list(data))
+
+    # -- identity ------------------------------------------------------------
+    def who_am_i(self):
+        return self._read(self.CMD_WHO_AM_I, 1, "B")[0]
+
+    def check_who_am_i(self):
+        w = self.who_am_i()
+        if w != self.addr:
+            raise WhoAmIMismatch(
+                f"WHO_AM_I returned {w:#04x}, expected {self.addr:#04x} -- "
+                f"something else is on i2c-{self.bus_num} at that address")
+
+    def get_firmware_version(self):
+        return self._read(self.CMD_FIRMWARE_VERSION, 3, "BBB")
+
+    def check_firmware_version(self):
+        major, minor, patch = self.get_firmware_version()
+        need_major, need_minor = REQUIRED_FIRMWARE
+        if major != need_major or minor < need_minor:
+            raise FirmwareVersionMismatch(
+                f"board runs firmware {major}.{minor}.{patch}, this expects "
+                f"{need_major}.{need_minor}.*")
+
+    # -- motors --------------------------------------------------------------
+    def set_raw_motor_speed(self, left, right):
+        """Open loop, -127..127 each. Clamped -- the board rejects out-of-range."""
+        left = max(-SPEED_LIMIT, min(SPEED_LIMIT, int(left)))
+        right = max(-SPEED_LIMIT, min(SPEED_LIMIT, int(right)))
+        self._write(self.CMD_RAW_MOTOR_SPEED, struct.pack("bb", left, right))
+
+    def standby(self):
+        """Motors off, board idle."""
+        self._write(self.CMD_RAW_MOTOR_SPEED,
+                    struct.pack("bb", self.STANDBY, self.STANDBY))
+
+    def set_motor_shutdown_timeout(self, seconds):
+        """Board stops the motors if it hears nothing for this long. 0.1-10 s."""
+        if not 0.1 <= seconds <= 10.0:
+            raise ValueError("shutdown timeout must be 0.1-10 s")
+        self._write(self.CMD_MOTOR_SHUTDOWN_TIMEOUT, [round(seconds * 10)])
+
+    # -- encoders ------------------------------------------------------------
+    def get_raw_encoder_ticks(self):
+        """Absolute uint16 per side, wrapping. Deltas are taken against these."""
+        return self._read(self.CMD_RAW_ENCODER_TICKS, 4, "HH")
+
+    def get_status(self):
+        (s,) = self._read(self.CMD_STATUS, 1, "B")
+        return {"moving": bool(s & 1), "controlled": bool(s & 2)}
 
 
 class MotorDriver:
-    """Differential drive on the unit's controller board.
+    """Differential drive. set_velocity(v, w): v forward m/s, w yaw rad/s, +w = LEFT."""
 
-    set_velocity(v, w) is all nav calls: v forward m/s, w yaw rad/s, POSITIVE = LEFT.
-    """
-
-    def __init__(self, bus=I2C_BUS, addr=I2C_ADDR, max_speed=MAX_SPEED_RAW):
-        Controller = load_controller_class()
-        if addr != Controller.I2C_ADDR:
-            Controller.I2C_ADDR = addr
-        # Raises WhoAmIMismatch or FirmwareVersionMismatch -- both worth surfacing
-        # as-is rather than swallowing; a wrong board should not look like no board.
-        self.board = Controller(i2c_bus=bus)
+    def __init__(self, bus=I2C_BUS, addr=I2C_ADDR, max_speed=MAX_SPEED_RAW,
+                 controller=None):
+        self.board = controller if controller is not None else MotorController(bus, addr)
         self.max_speed = min(abs(max_speed), SPEED_LIMIT)
         self.last = (0, 0)
 
-        # The board watchdog beats a Python one: it still fires if this process is
-        # killed, which is exactly when a robot running away matters most.
         try:
             self.board.set_motor_shutdown_timeout(BOARD_WATCHDOG_S)
         except Exception as exc:                     # noqa: BLE001
-            print(f"[drive] could not set board watchdog: {exc}")
+            print(f"[drive] could not set the board watchdog: {exc}")
 
-        # Odometry: accumulate wraparound-safe deltas into a real running total.
-        self._relative = self.board.new_relative()
+        self._prev = self._read_raw()
         self.ticks = [0, 0]
 
-        print(f"[drive] unit controller 0x{addr:02x} on i2c-{bus}, "
-              f"firmware {'.'.join(map(str, self.board.get_firmware_version()))}, "
+        try:
+            fw = ".".join(map(str, self.board.get_firmware_version()))
+        except Exception:                            # noqa: BLE001
+            fw = "?"
+        print(f"[drive] controller 0x{addr:02x} on i2c-{bus}, firmware {fw}, "
               f"max raw speed {self.max_speed}")
 
     # -- commands ------------------------------------------------------------
@@ -123,10 +177,7 @@ class MotorDriver:
         self.set_raw(to_raw(left, self.max_speed), to_raw(right, self.max_speed))
 
     def set_raw(self, left, right):
-        """Clamped to the board's -127..127 -- outside it, controller.py raises."""
-        left = max(-SPEED_LIMIT, min(SPEED_LIMIT, int(left)))
-        right = max(-SPEED_LIMIT, min(SPEED_LIMIT, int(right)))
-        self.last = (left, right)
+        self.last = (int(left), int(right))
         self.board.set_raw_motor_speed(left, right)
 
     def stop(self):
@@ -145,22 +196,34 @@ class MotorDriver:
             pass
 
     # -- feedback ------------------------------------------------------------
+    def _read_raw(self):
+        try:
+            return self.board.get_raw_encoder_ticks()
+        except Exception:                            # noqa: BLE001
+            return None
+
     def read_encoders(self):
         """(left, right) cumulative ticks since this driver started, or None.
 
-        Accumulated from get_relative_encoder_ticks() rather than read straight from
-        get_encoder_ticks(): that one is documented as returning the count since the
-        last query, so treating it as an absolute total would silently produce
-        nonsense the moment anything else polled the board.
+        Accumulated from wrapping uint16 counters: each poll takes the difference
+        against the previous reading and reinterprets it as int16, so it stays correct
+        across the 65535 -> 0 rollover and counts down when reversing. Poll often
+        enough that a wheel can't turn more than half a counter between reads.
         """
-        try:
-            dl, dr = self.board.get_relative_encoder_ticks(self._relative)
-        except Exception as exc:                     # noqa: BLE001
-            print(f"[drive] encoder read failed: {exc}")
+        now = self._read_raw()
+        if now is None:
             return None
-        self.ticks[0] += dl
-        self.ticks[1] += dr
+        if self._prev is None:
+            self._prev = now
+            return tuple(self.ticks)
+        self.ticks[0] += _to_i16(now[0] - self._prev[0])
+        self.ticks[1] += _to_i16(now[1] - self._prev[1])
+        self._prev = now
         return tuple(self.ticks)
+
+    def reset_encoders(self):
+        self.ticks = [0, 0]
+        self._prev = self._read_raw()
 
     def status(self):
         try:
@@ -190,13 +253,11 @@ def to_raw(wheel_mps, max_speed=MAX_SPEED_RAW, max_wheel_rpm=MAX_WHEEL_RPM,
     frac = abs(wheel_mps) / max_mps
     if frac < 0.01:
         return 0
-    frac = min(frac, 1.0)
-    raw = min_speed + frac * (max_speed - min_speed)
+    raw = min_speed + min(frac, 1.0) * (max_speed - min_speed)
     return int(math.copysign(min(raw, SPEED_LIMIT), wheel_mps))
 
 
-# NOTE for later: the board also does closed-loop speed via set_motor_speed(), in
-# ticks per 1/100 s, regulated by its own PID (tunable with set_pid_coefficients).
-# That would hold a straight line far better than open-loop raw PWM, which drifts
-# whenever the two motors differ. Worth moving to once MAX_WHEEL_RPM is measured and
-# there's a tick-per-metre figure to convert against.
+# NOTE for later: the board also does closed-loop speed (CMD_CONTROLLED_MOTOR_SPEED,
+# 0x31, "<hh" in ticks per 1/100 s) regulated by its own PID. That holds a straight
+# line far better than open-loop PWM, which drifts whenever the two motors differ.
+# Worth adding once MAX_WHEEL_RPM is measured and there's a ticks-per-metre figure.

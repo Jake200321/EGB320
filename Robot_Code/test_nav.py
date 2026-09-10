@@ -212,8 +212,14 @@ check("full speed is capped at MAX_SPEED_RAW",
       MOT.to_raw(99.0) == MOT.MAX_SPEED_RAW)
 check("never exceeds the board's -127..127, which controller.py rejects",
       all(-127 <= MOT.to_raw(v) <= 127 for v in (-99, -1, -0.001, 0, 0.001, 1, 99)))
-check("controller.py is importable from where the examples live",
-      MOT.load_controller_class().I2C_ADDR == 0x57)
+check("no dependency on the EGB320_Examples files",
+      not any(w in open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     f)).read()
+              for f in ("motors.py", "main.py", "motor_spin_test.py")
+              for w in ("from controller import", "import controller\n")))
+check("encoder wraparound: 65535 -> 0 counts as +1", MOT._to_i16(0 - 65535) == 1)
+check("...and reversing counts down", MOT._to_i16(65535 - 0) == -1)
+check("standby is the reserved -128", MOT.MotorController.STANDBY == -128)
 check("reverse is negative", MOT.to_raw(-0.10) < 0)
 check("magnitude matches forward", abs(MOT.to_raw(-0.10)) == MOT.to_raw(0.10))
 check("board address is the unit's, not the DFRobot one",
