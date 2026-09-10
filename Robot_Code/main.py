@@ -520,79 +520,49 @@ class Ultrasonics:
 # Drive
 # ===========================================================================
 class Drive:
-    """Differential drive over the DFR0592 HAT.
+    """Differential drive on the unit's controller board (0x57, i2c-8).
 
-    set_velocity(v, w) is the only thing nav calls: v forward m/s, w yaw rad/s with
-    POSITIVE = LEFT. If the HAT isn't answering (which it currently isn't) this
-    becomes a no-op that logs commands, so the rest of the loop still runs honestly.
+    Thin wrapper over motors.MotorDriver so nav has one call -- set_velocity(v, w),
+    v forward m/s, w yaw rad/s with POSITIVE = LEFT. If the board isn't there this
+    becomes a no-op that records commands, so the rest of the loop still runs.
     """
 
-    TRACK_M = 0.123             # Pololu 30T sprocket centre-to-centre
-    SPROCKET_CIRCUM_M = math.pi * 0.024
-    GEAR_RATIO = 50
-    MAX_WHEEL_RPM = 200.0       # MEASURE -- see motor_spin_test.py
-    MIN_DUTY, MAX_DUTY = 25.0, 80.0   # MAX_DUTY: 6 V motors on a 7-12 V rail
-
     def __init__(self, enabled=True):
-        self.board = None
+        self.driver = None
         self.last = (0.0, 0.0)
         if not enabled:
-            print("[drive] disabled (--no-motors)")
+            STATUS.event("[drive] disabled (--no-motors)")
             return
         try:
-            from motor_spin_test import load_board_class, I2C_BUS, HAT_ADDRESS
-            board = load_board_class()(I2C_BUS, HAT_ADDRESS)
-            for _ in range(3):
-                if board.begin() == board.STA_OK:
-                    break
-                time.sleep(0.3)
-            else:
-                raise RuntimeError(f"no response at 0x{HAT_ADDRESS:02x} on i2c-{I2C_BUS}")
-            board.set_encoder_enable(board.ALL)
-            board.set_encoder_reduction_ratio(board.ALL, self.GEAR_RATIO)
-            board.motor_stop(board.ALL)
-            self.board = board
-            print("[drive] DFR0592 online")
-        except Exception as exc:                       # noqa: BLE001
-            print(f"[drive] NO MOTORS -- {type(exc).__name__}: {exc}")
+            from motors import MotorDriver
+            self.driver = MotorDriver()
+        except Exception as exc:                   # noqa: BLE001
+            STATUS.event(f"[drive] NO MOTORS -- {type(exc).__name__}: {exc}")
+
+    @property
+    def board(self):
+        """Truthy when motors are live -- what the status line reports on."""
+        return self.driver
 
     def set_velocity(self, v_mps, w_rps):
         self.last = (v_mps, w_rps)
-        if self.board is None:
-            return
-        half = self.TRACK_M / 2.0
-        rpm_l = (v_mps - w_rps * half) / self.SPROCKET_CIRCUM_M * 60.0
-        rpm_r = (v_mps + w_rps * half) / self.SPROCKET_CIRCUM_M * 60.0
-        peak = max(abs(rpm_l), abs(rpm_r))
-        if peak > self.MAX_WHEEL_RPM:                  # scale BOTH, or the turn radius changes
-            rpm_l *= self.MAX_WHEEL_RPM / peak
-            rpm_r *= self.MAX_WHEEL_RPM / peak
-        self._channel(1, rpm_l, invert=False)
-        self._channel(2, rpm_r, invert=True)           # motors face opposite ways
+        if self.driver is not None:
+            self.driver.set_velocity(v_mps, w_rps)
 
-    def _channel(self, motor_id, rpm, invert):
-        frac = min(abs(rpm) / self.MAX_WHEEL_RPM, 1.0)
-        if frac < 0.01:
-            self.board.motor_stop(motor_id)
-            return
-        duty = self.MIN_DUTY + frac * (self.MAX_DUTY - self.MIN_DUTY)
-        forward = (rpm > 0) != invert
-        self.board.motor_movement(motor_id,
-                                  self.board.CW if forward else self.board.CCW, duty)
+    def read_encoders(self):
+        return None if self.driver is None else self.driver.read_encoders()
 
     def stop(self):
         """Never raises -- called on every exit path."""
         self.last = (0.0, 0.0)
-        try:
-            if self.board is not None:
-                self.board.motor_stop(self.board.ALL)
-        except Exception as exc:                       # noqa: BLE001
-            print(f"[drive] stop failed: {exc}")
+        if self.driver is not None:
+            self.driver.stop()
+
+    def close(self):
+        if self.driver is not None:
+            self.driver.close()
 
 
-# ===========================================================================
-# Vision
-# ===========================================================================
 def horizon_row(frame_h, tilt_deg=None, vfov_deg=None):
     """Image row where the ground plane meets the horizon.
 

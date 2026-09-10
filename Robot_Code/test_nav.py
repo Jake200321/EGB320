@@ -198,6 +198,23 @@ check("stays DONE -- terminal, even with a victim in view", n.state == M.DONE)
 check("red stays on", l.r is True)
 check("motors stay stopped", d.last == (0.0, 0.0))
 
+print("12c) motors.py maths: differential drive and raw-speed mapping")
+import motors as MOT
+_l, _r = MOT.wheel_speeds(0.10, 0.0)
+check("straight: both wheels equal", _l == _r == 0.10)
+_l, _r = MOT.wheel_speeds(0.0, 1.0)
+check("spin: equal and opposite", abs(_l + _r) < 1e-9 and _r > 0)
+_l, _r = MOT.wheel_speeds(0.10, 0.5)
+check("+w turns left, so the right wheel runs faster", _r > _l)
+check("stop maps to raw 0", MOT.to_raw(0.0) == 0)
+check("a creep still clears stiction", MOT.to_raw(0.004) >= MOT.MIN_SPEED_RAW)
+check("full speed is capped at MAX_SPEED_RAW",
+      MOT.to_raw(99.0) == MOT.MAX_SPEED_RAW)
+check("reverse is negative", MOT.to_raw(-0.10) < 0)
+check("magnitude matches forward", abs(MOT.to_raw(-0.10)) == MOT.to_raw(0.10))
+check("board address is the unit's, not the DFRobot one",
+      (MOT.I2C_ADDR, MOT.I2C_BUS) == (0x57, 8))
+
 print("13) a blurred frame is not the victim disappearing")
 # classify_frame() returns None on a motion-blurred frame, which is NOT an empty
 # result. Nav must hold what it knows rather than counting it as a miss -- otherwise
