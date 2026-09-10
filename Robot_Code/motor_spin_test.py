@@ -75,6 +75,8 @@ def main():
     ap.add_argument("--bus", type=int, default=I2C_BUS)
     ap.add_argument("--addr", type=lambda v: int(v, 0), default=I2C_ADDR)
     ap.add_argument("--whoami", action="store_true")
+    ap.add_argument("--spin", action="store_true",
+                    help="spin left then right, to check turn direction")
     args = ap.parse_args()
 
     if not 1 <= args.speed <= 127:
@@ -91,6 +93,21 @@ def main():
 
     s = args.speed
     try:
+        if args.spin:
+            # Sent through MotorDriver, so this exercises the real signs and swap --
+            # unlike the per-motor tests below, which are deliberately raw.
+            from motors import MotorDriver
+            d = MotorDriver(controller=board)
+            for label, w in (("LEFT (counter-clockwise)", 2.0),
+                             ("RIGHT (clockwise)", -2.0)):
+                print(f"\n>>> should spin {label}")
+                d.set_velocity(0.0, w)
+                time.sleep(args.seconds)
+                d.stop()
+                time.sleep(0.5)
+            print("\n    -> did it spin the way each line said?")
+            print("       no  -> set SWAP_MOTORS = True in motors.py")
+            return
         if args.motor in (None, "left"):
             run(board, s, 0, args.seconds, "LEFT track, positive speed")
             run(board, -s, 0, args.seconds, "LEFT track, negative speed")

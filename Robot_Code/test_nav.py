@@ -346,6 +346,7 @@ check(f"the smallest heading nudge still moves ({_nudge}/127, want >MIN_SPEED_RA
       _nudge > MOT.MIN_SPEED_RAW)
 check("full board range is available", MOT.MAX_SPEED_RAW == 127)
 
+
 # Motor direction: the sign flip must reach the board AND the odometry, or a
 # reversed motor drives right and counts backwards.
 class _FakeBoard:
@@ -368,6 +369,26 @@ _t = _d.read_encoders()
 check("reversed motors also count forward", _t == (-100, -100) or _t == (100, 100))
 check("...specifically, the sign is applied to ticks too", _t == (-100, -100))
 MOT.LEFT_SIGN, MOT.RIGHT_SIGN = _old
+
+# SWAP_MOTORS has to reach the encoders as well as the motors. If it only swapped
+# the commands, the straight-line correction would read the wrong track and steer
+# away from straight -- a bug that only shows up while driving, not on the bench.
+_was = MOT.SWAP_MOTORS
+for _swap in (False, True):
+    MOT.SWAP_MOTORS = _swap
+    _fb2 = _FakeBoard()
+    _d2 = MOT.MotorDriver(controller=_fb2)
+    _d2.set_velocity(0.0, 2.0)                 # spin left
+    _fb2.raw = (300, 100)
+    _t2 = _d2.read_encoders()
+    if not _swap:
+        _unswapped_cmd, _unswapped_ticks = _fb2.sent, _t2
+    else:
+        check("SWAP_MOTORS mirrors the motor command",
+              _fb2.sent == (_unswapped_cmd[1], _unswapped_cmd[0]))
+        check("SWAP_MOTORS mirrors the encoder channels too",
+              _t2 == (_unswapped_ticks[1], _unswapped_ticks[0]))
+MOT.SWAP_MOTORS = _was
 check("reverse is negative", MOT.to_raw(-0.10) < 0)
 check("magnitude matches forward", abs(MOT.to_raw(-0.10)) == MOT.to_raw(0.10))
 check("board address is the unit's, not the DFRobot one",

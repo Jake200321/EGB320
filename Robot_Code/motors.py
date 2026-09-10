@@ -53,6 +53,18 @@ MAX_WHEEL_RPM = 130.0
 # Encoder counts are flipped by the same sign, so forward always counts up.
 LEFT_SIGN = -1
 RIGHT_SIGN = -1
+
+# Set True if the board's two channels are wired to the opposite tracks. Tell it
+# apart from a sign problem by what the robot gets WRONG:
+#
+#   drives backwards, turns correctly     -> both signs are wrong
+#   spins instead of driving straight     -> one sign is wrong
+#   drives straight fine, turns MIRRORED  -> SWAP_MOTORS  (signs are fine)
+#
+# A swap leaves straight driving looking perfect, because both channels get the same
+# command -- it only shows up the moment the robot tries to turn. It also inverts the
+# encoder straight-line correction, which then steers further off instead of back.
+SWAP_MOTORS = False
 # -------------------------------------------------------------------------------
 
 SPEED_LIMIT = 127                   # the board's hard limit
@@ -196,8 +208,11 @@ class MotorDriver:
         self.set_raw(to_raw(left, self.max_speed), to_raw(right, self.max_speed))
 
     def set_raw(self, left, right):
-        """Applies LEFT_SIGN / RIGHT_SIGN, so callers always mean 'positive = forward'."""
+        """Applies LEFT_SIGN / RIGHT_SIGN and SWAP_MOTORS, so callers always mean
+        'positive = forward' on the track they named."""
         left, right = int(left) * LEFT_SIGN, int(right) * RIGHT_SIGN
+        if SWAP_MOTORS:
+            left, right = right, left
         self.last = (left, right)
         self.board.set_raw_motor_speed(left, right)
 
@@ -237,10 +252,15 @@ class MotorDriver:
         if self._prev is None:
             self._prev = now
             return tuple(self.ticks)
-        # Same sign flip as the motors, so a track driving forward always counts up
-        # no matter which way round it was mounted.
-        self.ticks[0] += _to_i16(now[0] - self._prev[0]) * LEFT_SIGN
-        self.ticks[1] += _to_i16(now[1] - self._prev[1]) * RIGHT_SIGN
+        # Same corrections as the motors: a track driving forward counts up, and the
+        # channels line up with the tracks they actually drive. Without the swap here
+        # the straight-line correction would steer away from straight.
+        dl = _to_i16(now[0] - self._prev[0])
+        dr = _to_i16(now[1] - self._prev[1])
+        if SWAP_MOTORS:
+            dl, dr = dr, dl
+        self.ticks[0] += dl * LEFT_SIGN
+        self.ticks[1] += dr * RIGHT_SIGN
         self._prev = now
         return tuple(self.ticks)
 
