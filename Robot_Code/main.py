@@ -104,7 +104,23 @@ DISTANCE_TOLERANCE_M = 0.02 # close enough -- stops hunting back and forth
 COLLISION_STOP_M = 0.12     # front sonar closer than this while searching = wall ahead
 WALL_NEAR_M = 0.20          # side sonar below this = wall alongside
 
-SEARCH_TURN_RATE = 0.6      # rad/s, spin speed while looking for a victim
+# --- exploring: drive straight, held straight by the encoders -----------------
+SEARCH_SPEED = 0.10         # m/s forward while exploring
+SEARCH_TURN_RATE = 0.6      # rad/s, spin rate when turning away from an obstacle
+TURN_CLEAR_M = 0.35         # keep turning until the front is at least this clear
+
+# Correction per tick of left-minus-right difference. It acts on ACCUMULATED ticks,
+# not instantaneous speed, so it drives the total distance error to zero -- which is
+# what "straight" means. Matching speeds alone would hold a constant heading error
+# forever. TUNE: too high oscillates, too low drifts.
+ENCODER_STRAIGHT_GAIN = 0.004      # rad/s per tick
+MAX_STRAIGHT_CORRECTION = 0.6      # rad/s cap, so a big error can't spin the robot
+
+# --- approach: hold the victim within HEADING_TOLERANCE_DEG -------------------
+HEADING_TOLERANCE_DEG = 1.0   # aim to keep the victim inside this
+HEADING_COARSE_DEG = 5.0      # beyond this, turn on the spot instead of driving
+MIN_TURN_RATE = 0.25          # rad/s -- under this the tracks don't break stiction,
+                              # so a small correction would command nothing at all
 APPROACH_SPEED = 0.10       # m/s, closing speed once a victim is being tracked
 CREEP_SPEED = 0.05          # m/s, inside CREEP_RANGE_M -- slow enough to stop cleanly
 CREEP_RANGE_M = 0.25
@@ -575,6 +591,26 @@ class Drive:
             self.driver.close()
 
 
+def heading_correction(bearing_deg):
+    """Yaw rate to put the victim on the nose, targeting HEADING_TOLERANCE_DEG.
+
+    Inside the tolerance the correction is exactly zero -- without that deadband a
+    proportional controller hunts either side of centre forever and never settles.
+
+    Outside it, the magnitude is floored at MIN_TURN_RATE. That matters because the
+    deadband compensation in motors.to_raw() turns anything smaller into a stop: a
+    2 degree error would otherwise command a yaw the tracks never actually execute,
+    and the robot would sit there off-heading believing it was correcting.
+
+    Vision reports +ve to the RIGHT, drive takes +ve as LEFT, so the sign flips here.
+    This is the one place the two conventions meet.
+    """
+    if abs(bearing_deg) <= HEADING_TOLERANCE_DEG:
+        return 0.0
+    w = math.copysign(max(abs(HEADING_GAIN * bearing_deg), MIN_TURN_RATE), -bearing_deg)
+    return max(-MAX_TURN_RATE, min(MAX_TURN_RATE, w))
+
+
 def camera_blind_range_m(height_m=None, tilt_deg=None, vfov_deg=None):
     """How close a floor object can get before its base leaves the bottom of frame.
 
@@ -795,6 +831,8 @@ class Nav:
         self._announced = False
         self.aligned = False        # was the victim well centred when last seen?
         self.closing_since = None
+        self.straight_ref = None    # encoder reading when this straight run began
+        self.ticks = None           # latest cumulative encoder ticks
 
     # -- transitions ------------------------------------------------------
     def _enter(self, state):
@@ -821,6 +859,7 @@ class Nav:
         if state == SEARCH:
             self._announced = False
             self.aligned = False
+            self.straight_ref = None
             self.leds.green(False)
             self.leds.yellow(False)
             self.leds.red(False)
@@ -857,6 +896,8 @@ class Nav:
 
     def step(self):
         self.sonar.update()                    # one ping per tick, before deciding
+        reader = getattr(self.drive, "read_encoders", None)
+        self.ticks = reader() if reader else None
         seen = self.vision.look()
 
         # Debounce both ways: a single frame should neither trigger an approach
@@ -901,14 +942,45 @@ class Nav:
                 # measure the camera constants.
                 self.drive.stop()
             return
-        # Spinning on the spot can't run into anything, but if the front sonar says
-        # a wall is right there, don't let a later state drive into it unnoticed.
         front = self.sonar.front
-        if front is not None and front < COLLISION_STOP_M:
+
+        # Something ahead: turn on the spot until it's clear, then start a fresh
+        # straight run. Hysteresis (in at COLLISION_STOP_M, out at TURN_CLEAR_M)
+        # stops it dithering on the threshold.
+        if self.blocked:
+            if front is None or front >= TURN_CLEAR_M:
+                self.blocked = False
+                self.straight_ref = None       # new heading, new straight run
+            else:
+                self.drive.set_velocity(0.0, SEARCH_TURN_RATE)
+                return
+        elif front is not None and front < COLLISION_STOP_M:
+            STATUS.event(f"[nav] wall at {front*100:.0f}cm -- turning")
             self.blocked = True
-        else:
-            self.blocked = False
-        self.drive.set_velocity(0.0, SEARCH_TURN_RATE)  # spin on the spot and look
+            self.straight_ref = None
+            self.drive.set_velocity(0.0, SEARCH_TURN_RATE)
+            return
+
+        self.drive.set_velocity(SEARCH_SPEED, self.straight_correction())
+
+    def straight_correction(self):
+        """Yaw correction that holds an explore run straight, from the encoders.
+
+        Compares how far each track has travelled since this run began and steers to
+        equalise them. With no encoders it returns 0.0 -- an open-loop straight line,
+        still forward, just uncorrected.
+        """
+        if self.ticks is None:
+            return 0.0
+        if self.straight_ref is None:
+            self.straight_ref = self.ticks
+            return 0.0
+        left = self.ticks[0] - self.straight_ref[0]
+        right = self.ticks[1] - self.straight_ref[1]
+        # Left ahead of right means it has veered RIGHT. +w turns left, which speeds
+        # the right track up and closes the gap.
+        w = ENCODER_STRAIGHT_GAIN * (left - right)
+        return max(-MAX_STRAIGHT_CORRECTION, min(MAX_STRAIGHT_CORRECTION, w))
 
     def _approach(self, lost):
         if lost:
@@ -930,10 +1002,7 @@ class Nav:
 
         self.aligned = abs(v.bearing_deg) <= CLOSING_ALIGN_DEG
         distance, source = self.victim_range()
-        # Steer on bearing regardless -- turning towards the victim is what brings it
-        # into the sonar cone. Vision reports +ve to the RIGHT; drive takes +ve as
-        # LEFT, so the sign flips here. This is the one place the two conventions meet.
-        w = max(-MAX_TURN_RATE, min(MAX_TURN_RATE, -HEADING_GAIN * v.bearing_deg))
+        w = heading_correction(v.bearing_deg)
 
         if distance is None:
             # Can't range it from here: rotate to centre it (which is what makes the
@@ -945,6 +1014,12 @@ class Nav:
             STATUS.event(f"[nav] VICTIM REACHED -- stopping at "
                          f"{distance*100:.1f} cm ({source})")
             self._enter(AT_VICTIM)
+            return
+
+        # Past HEADING_COARSE_DEG, turn on the spot: driving on while badly off
+        # heading travels further off course than the turn recovers.
+        if abs(v.bearing_deg) > HEADING_COARSE_DEG:
+            self.drive.set_velocity(0.0, w)
             return
 
         speed = CREEP_SPEED if distance < CREEP_RANGE_M else APPROACH_SPEED

@@ -19,8 +19,11 @@ import main as M
 
 # --------------------------------------------------------------------- fakes
 class FakeDrive:
-    def __init__(self): self.last = (0.0, 0.0); self.board = None
+    """Records commands. `ticks` is writable so a test can simulate track slip."""
+    def __init__(self, ticks=None):
+        self.last = (0.0, 0.0); self.board = None; self.ticks = ticks
     def set_velocity(self, v, w): self.last = (v, w)
+    def read_encoders(self): return self.ticks
     def stop(self): self.last = (0.0, 0.0)
 
 
@@ -70,11 +73,49 @@ def run(nav, ticks):
 
 
 # --------------------------------------------------------------------- tests
-print("1) SEARCH spins on the spot with green off")
+print("1) EXPLORING drives straight ahead with green off")
 d, l = FakeDrive(), FakeLeds()
 run(M.Nav(d, FakeVision([None] * 3), l, FakeSonar(front=1.0)), 3)
-check("spinning, no forward motion", d.last == (0.0, M.SEARCH_TURN_RATE))
+check("driving forward", d.last[0] == M.SEARCH_SPEED)
+check("dead straight with no encoder error", d.last[1] == 0.0)
 check("green off", l.g is False)
+
+print("1a) the encoders hold it straight")
+d = FakeDrive(ticks=(0, 0))
+n = M.Nav(d, FakeVision([None] * 20), FakeLeds(), FakeSonar(front=1.0))
+n.step()                                   # first tick sets the reference
+d.ticks = (500, 500)                       # both tracks equal
+n.step()
+check("tracks equal -> no correction", d.last[1] == 0.0)
+d.ticks = (600, 500)                       # left ran ahead: veered RIGHT
+n.step()
+check("veering right -> turns LEFT to correct", d.last[1] > 0)
+d.ticks = (500, 600)                       # right ran ahead: veered LEFT
+n.step()
+check("veering left -> turns RIGHT to correct", d.last[1] < 0)
+d.ticks = (99999, 0)                       # absurd error
+n.step()
+check("correction is capped", abs(d.last[1]) <= M.MAX_STRAIGHT_CORRECTION)
+check("still driving forward while correcting", d.last[0] == M.SEARCH_SPEED)
+
+print("1b) no encoders -> open-loop straight, not a crash")
+d = FakeDrive(ticks=None)
+run(M.Nav(d, FakeVision([None] * 3), FakeLeds(), FakeSonar(front=1.0)), 3)
+check("still drives forward", d.last == (M.SEARCH_SPEED, 0.0))
+
+print("1c) a wall ahead turns on the spot, with hysteresis")
+d, son = FakeDrive(ticks=(0, 0)), FakeSonar(front=1.0)
+n = M.Nav(d, FakeVision([None] * 30), FakeLeds(), son)
+n.step()
+son.front = 0.08                           # wall
+n.step()
+check("stops driving and spins", d.last[0] == 0.0 and d.last[1] != 0.0)
+son.front = 0.20                           # clearing, but not clear enough yet
+n.step()
+check("keeps turning below TURN_CLEAR_M", d.last[0] == 0.0)
+son.front = 0.50                           # clear
+n.step(); n.step()
+check("resumes driving once clear", d.last[0] == M.SEARCH_SPEED)
 
 print("2) one frame doesn't commit; DETECTION_DEBOUNCE frames do")
 d, l = FakeDrive(), FakeLeds()
@@ -85,15 +126,37 @@ run(n, 4)
 check("APPROACH once debounced", n.state == M.APPROACH)
 check("green ON", l.g is True)
 
-print("3) approach steers the right way (+bearing = right = negative yaw)")
-# Bearing kept inside US_TRUST_BEARING_DEG so the sonar is believed and it closes;
-# test 9 covers the off-axis case, where refusing to close is the correct answer.
+print("2a) approach holds heading to within HEADING_TOLERANCE_DEG")
+check("dead centre -> no correction", M.heading_correction(0.0) == 0.0)
+check("inside tolerance -> no correction, no hunting",
+      M.heading_correction(M.HEADING_TOLERANCE_DEG) == 0.0)
+check("just outside tolerance -> it does correct",
+      M.heading_correction(M.HEADING_TOLERANCE_DEG + 0.2) != 0.0)
+check("a small error still commands a real turn, not one the tracks ignore",
+      abs(M.heading_correction(2.0)) >= M.MIN_TURN_RATE)
+check("victim to the right -> turn right", M.heading_correction(10.0) < 0)
+check("victim to the left -> turn left", M.heading_correction(-10.0) > 0)
+check("capped at MAX_TURN_RATE", abs(M.heading_correction(180.0)) <= M.MAX_TURN_RATE)
+check("symmetric", M.heading_correction(7.0) == -M.heading_correction(-7.0))
+
+print("2b) badly off heading, it turns on the spot rather than driving off course")
 d = FakeDrive()
-run(M.Nav(d, FakeVision([V(bearing=8.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
+run(M.Nav(d, FakeVision([V(bearing=30.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
+check("no forward motion while way off heading", d.last[0] == 0.0)
+check("turning towards it", d.last[1] < 0)
+d = FakeDrive()
+run(M.Nav(d, FakeVision([V(bearing=0.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
+check("lined up -> drives, no correction", d.last[0] > 0 and d.last[1] == 0.0)
+
+print("3) approach steers the right way (+bearing = right = negative yaw)")
+# Bearing inside HEADING_COARSE_DEG so it drives while correcting (2b covers the
+# turn-on-the-spot case) and inside US_TRUST_BEARING_DEG so the sonar is believed.
+d = FakeDrive()
+run(M.Nav(d, FakeVision([V(bearing=3.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
 check("driving forward", d.last[0] > 0)
 check("yaw negative for a victim to the right", d.last[1] < 0)
 d = FakeDrive()
-run(M.Nav(d, FakeVision([V(bearing=-8.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
+run(M.Nav(d, FakeVision([V(bearing=-3.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
 check("yaw positive for a victim to the left", d.last[1] > 0)
 
 print("4) creeps when close")
