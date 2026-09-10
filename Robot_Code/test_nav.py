@@ -178,6 +178,56 @@ n.step()
 check("stops closing", d.last[0] == 0.0)
 check("stays in APPROACH", n.state == M.APPROACH)
 
+print("12a) losing sight of the victim close up commits to a sonar run-in")
+# At 10 cm camera height the victim leaves the frame around 27 cm out. That must not
+# read as "victim lost" -- it's the moment the approach is most nearly finished.
+d, l, son = FakeDrive(), FakeLeds(), FakeSonar(front=0.25)
+n = M.Nav(d, FakeVision([V()] * 3 + [None] * 20), l, son)
+run(n, 4)
+check("approaching first", n.state == M.APPROACH)
+run(n, 12)                                     # victim disappears under the camera
+check("hands over to CLOSING, does not go back to SEARCH", n.state == M.CLOSING)
+check("still driving forward", d.last[0] > 0)
+check("straight -- no steering with nothing to steer on", d.last[1] == 0.0)
+check("green stays on", l.g is True)
+son.front = 0.10
+n.step()
+check("sonar alone gets it to AT_VICTIM", n.state == M.AT_VICTIM)
+
+print("12a-ii) but it only commits when lined up and close")
+for front, bearing, why in [(0.80, 0.0, "too far to be the under-camera case"),
+                            (0.25, 40.0, "off to one side, not lined up"),
+                            (None, 0.0, "no sonar range at all")]:
+    d2, l2 = FakeDrive(), FakeLeds()
+    n2 = M.Nav(d2, FakeVision([V(bearing=bearing)] * 3 + [None] * 20), l2,
+               FakeSonar(front=front))
+    run(n2, 16)
+    check(f"{why} -> back to SEARCH", n2.state == M.SEARCH)
+
+print("12a-iii) the blind run-in gives up rather than driving forever")
+d3 = FakeDrive()
+n3 = M.Nav(d3, FakeVision([V()] * 3 + [None] * 40), FakeLeds(), FakeSonar(front=0.25))
+run(n3, 16)
+check("in CLOSING", n3.state == M.CLOSING)
+n3.closing_since = time.monotonic() - (M.CLOSING_TIMEOUT_S + 0.1)
+n3.step()
+check("timed out back to SEARCH", n3.state == M.SEARCH)
+check("stopped", d3.last == (0.0, 0.0))
+
+print("12a-iv) no range mid-run-in: hold, don't drive on faith")
+d4, son4 = FakeDrive(), FakeSonar(front=0.25)
+n4 = M.Nav(d4, FakeVision([V()] * 3 + [None] * 40), FakeLeds(), son4)
+run(n4, 16)
+son4.front = None
+n4.step()
+check("stops when the echo drops out", d4.last == (0.0, 0.0))
+check("stays in CLOSING", n4.state == M.CLOSING)
+
+print("12a-v) the geometry the handover is based on")
+_b = M.camera_blind_range_m()
+check("blind range is derived, not hardcoded", _b is not None and 0.2 < _b < 0.35)
+check("handover starts before the camera goes blind", M.CLOSING_TRIGGER_M > _b)
+
 print("12b) rescue times out after RESCUE_TIMEOUT_S and stops with red")
 d, l, son = FakeDrive(), FakeLeds(), FakeSonar(front=0.11)
 n = M.Nav(d, FakeVision([V()] * 400), l, son)

@@ -115,6 +115,16 @@ DETECTION_DEBOUNCE = 3      # consecutive frames before believing a detection
 LOST_GRACE_FRAMES = 8       # frames a victim may vanish for before we call it lost
 YELLOW_FLASH_HZ = 2.0
 RESCUE_TIMEOUT_S = 10.0     # how long the collection placeholder runs before giving up
+
+# --- the blind run-in ---------------------------------------------------------
+# Close up, the victim drops out of the bottom of the frame: at CAMERA_HEIGHT_M with
+# VERTICAL_FOV_DEG, an object on the floor stops being visible somewhere under
+# ~camera_blind_range_m(). Losing sight of it there is expected, NOT a lost victim --
+# so once we're lined up and this close, the approach commits and finishes on the
+# front sonar alone.
+CLOSING_TRIGGER_M = 0.30    # start trusting sonar alone below this
+CLOSING_ALIGN_DEG = 12.0    # ...but only if the victim was this well centred
+CLOSING_TIMEOUT_S = 5.0     # give up and go back to searching if it never arrives
 CONTROL_HZ = 20
 
 # --- camera ranging: measured on the robot 2026-09-09 -------------------------
@@ -150,6 +160,7 @@ WINDOW_NAME = "EGB320 nav"
 STATE_LABEL = {
     "SEARCH":    "EXPLORING",
     "APPROACH":  "APPROACHING VICTIM",
+    "CLOSING":   "CLOSING IN (camera blind)",
     "AT_VICTIM": "ENGAGING RESCUE",
     "DONE":      "STOPPED (rescue timed out)",
 }
@@ -293,7 +304,8 @@ def render_hud(frame, detections, nav, sonar, draw_detections=None):
     # --- state banner ---
     state = STATE_LABEL.get(nav.state, nav.state)
     colour = {"SEARCH": (200, 200, 200), "APPROACH": (0, 220, 255),
-              "AT_VICTIM": (0, 255, 0), "DONE": (0, 0, 255)}.get(nav.state, (255, 255, 255))
+              "CLOSING": (0, 170, 255), "AT_VICTIM": (0, 255, 0),
+              "DONE": (0, 0, 255)}.get(nav.state, (255, 255, 255))
     cv2.rectangle(img, (0, 0), (w, 30), (0, 0, 0), -1)
     cv2.putText(img, state, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.65, colour, 2)
 
@@ -563,6 +575,24 @@ class Drive:
             self.driver.close()
 
 
+def camera_blind_range_m(height_m=None, tilt_deg=None, vfov_deg=None):
+    """How close a floor object can get before its base leaves the bottom of frame.
+
+    Below this the camera cannot range it -- or see it at all -- which is why the
+    last stretch of the approach has to run on sonar. Returns None if the camera
+    geometry isn't known.
+    """
+    h = CAMERA_HEIGHT_M if height_m is None else height_m
+    tilt = CAMERA_TILT_DEG if tilt_deg is None else tilt_deg
+    vfov = VERTICAL_FOV_DEG if vfov_deg is None else vfov_deg
+    if None in (h, tilt, vfov):
+        return None
+    edge_deg = tilt + vfov / 2.0        # depression angle at the bottom row
+    if edge_deg <= 0:
+        return None
+    return h / math.tan(math.radians(edge_deg))
+
+
 def horizon_row(frame_h, tilt_deg=None, vfov_deg=None):
     """Image row where the ground plane meets the horizon.
 
@@ -748,7 +778,8 @@ class VictimVision:
 # ===========================================================================
 # Nav loop
 # ===========================================================================
-SEARCH, APPROACH, AT_VICTIM, DONE = "SEARCH", "APPROACH", "AT_VICTIM", "DONE"
+SEARCH, APPROACH, CLOSING, AT_VICTIM, DONE = (
+    "SEARCH", "APPROACH", "CLOSING", "AT_VICTIM", "DONE")
 
 
 class Nav:
@@ -762,6 +793,8 @@ class Nav:
         self.arrived_at = None
         self.blocked = False
         self._announced = False
+        self.aligned = False        # was the victim well centred when last seen?
+        self.closing_since = None
 
     # -- transitions ------------------------------------------------------
     def _enter(self, state):
@@ -772,6 +805,11 @@ class Nav:
         if state == AT_VICTIM:
             self.arrived_at = time.monotonic()
             self.drive.stop()
+        if state == CLOSING:
+            self.closing_since = time.monotonic()
+            # Drop the stale detection: it's behind/underneath us now, and leaving it
+            # around would draw a box where the victim no longer is.
+            self.victim = None
         if state == DONE:
             # Set the final state here rather than waiting for the next tick, so
             # there's no window where the robot has stopped but the red LED hasn't
@@ -782,6 +820,7 @@ class Nav:
             self.leds.red(True)
         if state == SEARCH:
             self._announced = False
+            self.aligned = False
             self.leds.green(False)
             self.leds.yellow(False)
             self.leds.red(False)
@@ -801,6 +840,10 @@ class Nav:
         guessing. Approach steers the victim towards centre anyway, so the sonar
         becomes valid exactly when it matters most -- the last few centimetres.
         """
+        if self.state == CLOSING:
+            d = self.sonar.front
+            return (d, "sonar") if d is not None else (None, None)
+
         v = self.victim
         if v is None:
             return None, None
@@ -836,6 +879,8 @@ class Nav:
             self._search(confirmed)
         elif self.state == APPROACH:
             self._approach(lost)
+        elif self.state == CLOSING:
+            self._closing()
         elif self.state == AT_VICTIM:
             self._at_victim()
         elif self.state == DONE:
@@ -867,13 +912,23 @@ class Nav:
 
     def _approach(self, lost):
         if lost:
-            self.victim = None
-            self._enter(SEARCH)
+            # Losing sight of the victim this close is expected, not a failure: it has
+            # gone under the camera. If we were lined up on it, commit and finish on
+            # the sonar rather than turning away and hunting for it again.
+            front = self.sonar.front
+            if self.aligned and front is not None and front <= CLOSING_TRIGGER_M:
+                STATUS.event(f"[nav] victim under the camera at {front*100:.0f}cm -- "
+                             "closing on sonar")
+                self._enter(CLOSING)
+            else:
+                self.victim = None
+                self._enter(SEARCH)
             return
 
         v = self.victim
         self.leds.green(True)
 
+        self.aligned = abs(v.bearing_deg) <= CLOSING_ALIGN_DEG
         distance, source = self.victim_range()
         # Steer on bearing regardless -- turning towards the victim is what brings it
         # into the sonar cone. Vision reports +ve to the RIGHT; drive takes +ve as
@@ -894,6 +949,35 @@ class Nav:
 
         speed = CREEP_SPEED if distance < CREEP_RANGE_M else APPROACH_SPEED
         self.drive.set_velocity(speed, w)
+
+    def _closing(self):
+        """Final run-in with the victim out of frame. Straight ahead, sonar only.
+
+        No steering: there's nothing to steer on, and a blind correction would be a
+        guess. It ran in aligned, so it drives straight and stops on range.
+        """
+        self.leds.green(True)
+        elapsed = time.monotonic() - self.closing_since
+
+        if elapsed > CLOSING_TIMEOUT_S:
+            STATUS.event(f"[nav] blind run-in gave up after {elapsed:.1f}s -- searching")
+            self.drive.stop()
+            self._enter(SEARCH)
+            return
+
+        front = self.sonar.front
+        if front is None:
+            # No vision and no range is no information at all -- hold rather than
+            # drive forward on faith.
+            self.drive.stop()
+            return
+
+        if front - STOP_DISTANCE_M <= DISTANCE_TOLERANCE_M:
+            STATUS.event(f"[nav] VICTIM REACHED -- stopping at {front*100:.1f} cm (sonar)")
+            self._enter(AT_VICTIM)
+            return
+
+        self.drive.set_velocity(CREEP_SPEED, 0.0)
 
     def _at_victim(self):
         """Stopped 10 cm short. Flash yellow -- Roger's collection code goes here.
