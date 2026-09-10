@@ -36,6 +36,21 @@ TRACK_M = 0.123                     # Pololu 30T sprocket centre-to-centre
 SPROCKET_CIRCUM_M = math.pi * 0.024
 MAX_WHEEL_RPM = 200.0               # MEASURE -- output-shaft RPM at MAX_SPEED_RAW
 
+# ---- MOTOR DIRECTION -- change these if a track drives the wrong way ----------
+# Which way a POSITIVE raw speed turns each track. The motors sit facing opposite
+# directions on the chassis, and can be mounted backwards, so these fix it in
+# software instead of rewiring.
+#
+#   both tracks drive backwards  -> set BOTH to -1
+#   one track backwards          -> set just that one to -1
+#   robot spins instead of driving straight -> the two disagree; flip one
+#
+# Find out with:  python3 motor_spin_test.py
+# Encoder counts are flipped by the same sign, so forward always counts up.
+LEFT_SIGN = 1
+RIGHT_SIGN = 1
+# -------------------------------------------------------------------------------
+
 SPEED_LIMIT = 127                   # the board's hard limit
 MAX_SPEED_RAW = 90                  # what "full speed" maps to (6 V motors)
 MIN_SPEED_RAW = 30                  # below this the geartrain stalls. MEASURE
@@ -177,7 +192,9 @@ class MotorDriver:
         self.set_raw(to_raw(left, self.max_speed), to_raw(right, self.max_speed))
 
     def set_raw(self, left, right):
-        self.last = (int(left), int(right))
+        """Applies LEFT_SIGN / RIGHT_SIGN, so callers always mean 'positive = forward'."""
+        left, right = int(left) * LEFT_SIGN, int(right) * RIGHT_SIGN
+        self.last = (left, right)
         self.board.set_raw_motor_speed(left, right)
 
     def stop(self):
@@ -216,8 +233,10 @@ class MotorDriver:
         if self._prev is None:
             self._prev = now
             return tuple(self.ticks)
-        self.ticks[0] += _to_i16(now[0] - self._prev[0])
-        self.ticks[1] += _to_i16(now[1] - self._prev[1])
+        # Same sign flip as the motors, so a track driving forward always counts up
+        # no matter which way round it was mounted.
+        self.ticks[0] += _to_i16(now[0] - self._prev[0]) * LEFT_SIGN
+        self.ticks[1] += _to_i16(now[1] - self._prev[1]) * RIGHT_SIGN
         self._prev = now
         return tuple(self.ticks)
 

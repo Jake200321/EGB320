@@ -28,7 +28,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from motors import I2C_ADDR, I2C_BUS, MotorController   # noqa: E402
+from motors import I2C_ADDR, I2C_BUS, LEFT_SIGN, RIGHT_SIGN, MotorController  # noqa: E402
 
 
 def connect(bus, addr):
@@ -81,6 +81,8 @@ def main():
         raise SystemExit("--speed must be 1..127")
 
     board = connect(args.bus, args.addr)
+    print(f"motors.py currently has LEFT_SIGN={LEFT_SIGN}, RIGHT_SIGN={RIGHT_SIGN} "
+          "(this test sends raw, unflipped speeds so you can see the truth)")
     if args.whoami:
         print(f"who_am_i: {board.who_am_i():#04x}")
         print(f"status:   {board.get_status()}")
@@ -92,11 +94,13 @@ def main():
         if args.motor in (None, "left"):
             run(board, s, 0, args.seconds, "LEFT track, positive speed")
             run(board, -s, 0, args.seconds, "LEFT track, negative speed")
-            print("    -> which drove the LEFT track FORWARD? Set LEFT_SIGN in motors.py.")
+            print("    -> if NEGATIVE speed drove the LEFT track forward, set "
+                  "LEFT_SIGN = -1 in motors.py")
         if args.motor in (None, "right"):
             run(board, 0, s, args.seconds, "RIGHT track, positive speed")
             run(board, 0, -s, args.seconds, "RIGHT track, negative speed")
-            print("    -> same for RIGHT_SIGN.")
+            print("    -> if NEGATIVE speed drove the RIGHT track forward, set "
+                  "RIGHT_SIGN = -1 in motors.py")
         if args.motor is None:
             run(board, s, s, args.seconds, "BOTH positive (straight, not a spin?)")
         print("\nDone.")

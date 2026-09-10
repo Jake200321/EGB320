@@ -220,6 +220,29 @@ check("no dependency on the EGB320_Examples files",
 check("encoder wraparound: 65535 -> 0 counts as +1", MOT._to_i16(0 - 65535) == 1)
 check("...and reversing counts down", MOT._to_i16(65535 - 0) == -1)
 check("standby is the reserved -128", MOT.MotorController.STANDBY == -128)
+
+# Motor direction: the sign flip must reach the board AND the odometry, or a
+# reversed motor drives right and counts backwards.
+class _FakeBoard:
+    STANDBY = -128
+    def __init__(s): s.sent = None; s.raw = (0, 0)
+    def set_raw_motor_speed(s, l, r): s.sent = (l, r)
+    def set_motor_shutdown_timeout(s, t): pass
+    def get_raw_encoder_ticks(s): return s.raw
+    def get_firmware_version(s): return (1, 3, 0)
+    def standby(s): pass
+
+_fb = _FakeBoard()
+_old = (MOT.LEFT_SIGN, MOT.RIGHT_SIGN)
+MOT.LEFT_SIGN = MOT.RIGHT_SIGN = -1
+_d = MOT.MotorDriver(controller=_fb)
+_d.set_raw(50, 50)
+check("LEFT_SIGN/RIGHT_SIGN reach the board", _fb.sent == (-50, -50))
+_fb.raw = (100, 100)                       # counters advanced
+_t = _d.read_encoders()
+check("reversed motors also count forward", _t == (-100, -100) or _t == (100, 100))
+check("...specifically, the sign is applied to ticks too", _t == (-100, -100))
+MOT.LEFT_SIGN, MOT.RIGHT_SIGN = _old
 check("reverse is negative", MOT.to_raw(-0.10) < 0)
 check("magnitude matches forward", abs(MOT.to_raw(-0.10)) == MOT.to_raw(0.10))
 check("board address is the unit's, not the DFRobot one",
