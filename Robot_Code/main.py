@@ -67,6 +67,12 @@ ULTRASONIC_PINS = {
     "left":  (5, 6),
     "right": (22, 27),
 }
+# Only these are pinged. The side sensors aren't fitted for the demo, and pinging a
+# sensor that isn't there costs a full echo timeout (~22 ms) every time its turn
+# comes round -- on a 50 ms control tick that is most of the budget, thrown away.
+# Add "left"/"right" back here once they're wired.
+SONARS_FITTED = ("front",)
+
 US_MAX_RANGE_M = 2.0        # ignore anything past this -- beyond the maze anyway
 US_MIN_TRIGGER_GAP_S = 0.06 # HC-SR04 wants >60 ms between pings; sensors are fired
                             # one at a time so their echoes can't be confused
@@ -107,6 +113,11 @@ WALL_NEAR_M = 0.20          # side sonar below this = wall alongside
 # --- exploring: drive straight, held straight by the encoders -----------------
 SEARCH_SPEED = 0.13         # m/s forward while exploring
 SEARCH_TURN_RATE = 2.4      # rad/s, spin rate when turning away from an obstacle
+# Which way to turn at a wall. -1 = right (clockwise), +1 = left. Always turning the
+# same way is the right-hand rule, which is a real maze strategy rather than just a
+# default -- it traverses any simply-connected maze, where alternating or random
+# turns can retrace the same ground.
+SEARCH_TURN_DIRECTION = -1
 TURN_CLEAR_M = 0.35         # keep turning until the front is at least this clear
 
 # Correction per tick of left-minus-right difference. It acts on ACCUMULATED ticks,
@@ -505,7 +516,8 @@ class Ultrasonics:
     a 2-second-old range is worse than admitting you don't know.
     """
 
-    # front, left, front, right -- front lands on half the ticks
+    # front, left, front, right -- front lands on half the ticks. Anything not in
+    # SONARS_FITTED is skipped, so with only the front fitted it gets every tick.
     ORDER = ["front", "left", "front", "right"]
 
     def __init__(self, pins=None, enabled=True):
@@ -517,6 +529,8 @@ class Ultrasonics:
             print("[sonar] disabled (--no-sonar)")
             return
         for name, (trig, echo) in (pins or ULTRASONIC_PINS).items():
+            if name not in SONARS_FITTED:
+                continue
             try:
                 self.sensors[name] = Ultrasonic(trig, echo)
             except Exception as exc:           # noqa: BLE001
@@ -532,8 +546,14 @@ class Ultrasonics:
         now = time.monotonic()
         if now - self._last_ping < US_MIN_TRIGGER_GAP_S:
             return                             # too soon; last echo may still be alive
-        name = self.ORDER[self._i % len(self.ORDER)]
-        self._i += 1
+        # Skip past anything not fitted rather than burning a tick on it.
+        for _ in range(len(self.ORDER)):
+            name = self.ORDER[self._i % len(self.ORDER)]
+            self._i += 1
+            if name in self.sensors:
+                break
+        else:
+            return
         sensor = self.sensors.get(name)
         if sensor is None:
             return
@@ -990,13 +1010,13 @@ class Nav:
                 self.blocked = False
                 self.straight_ref = None       # new heading, new straight run
             else:
-                self.drive.set_velocity(0.0, SEARCH_TURN_RATE)
+                self.drive.set_velocity(0.0, SEARCH_TURN_DIRECTION * SEARCH_TURN_RATE)
                 return
         elif front is not None and front < COLLISION_STOP_M:
             STATUS.event(f"[nav] wall at {front*100:.0f}cm -- turning")
             self.blocked = True
             self.straight_ref = None
-            self.drive.set_velocity(0.0, SEARCH_TURN_RATE)
+            self.drive.set_velocity(0.0, SEARCH_TURN_DIRECTION * SEARCH_TURN_RATE)
             return
 
         self.drive.set_velocity(SEARCH_SPEED, self.straight_correction())

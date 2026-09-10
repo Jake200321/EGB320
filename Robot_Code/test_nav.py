@@ -110,6 +110,8 @@ n.step()
 son.front = 0.08                           # wall
 n.step()
 check("stops driving and spins", d.last[0] == 0.0 and d.last[1] != 0.0)
+check("turns RIGHT at a wall (clockwise = negative yaw)", d.last[1] < 0)
+check("hard enough to pivot a tracked chassis", abs(d.last[1]) >= M.MIN_TURN_RATE_PIVOT)
 son.front = 0.20                           # clearing, but not clear enough yet
 n.step()
 check("keeps turning below TURN_CLEAR_M", d.last[0] == 0.0)
@@ -445,6 +447,21 @@ check("reverse is negative", MOT.to_raw(-0.10) < 0)
 check("magnitude matches forward", abs(MOT.to_raw(-0.10)) == MOT.to_raw(0.10))
 check("board address is the unit's, not the DFRobot one",
       (MOT.I2C_ADDR, MOT.I2C_BUS) == (0x57, 8))
+
+print("12d) only fitted sonars are pinged")
+# A sensor that isn't wired still costs a full echo timeout every time its turn
+# comes round -- ~22 ms against a 50 ms tick. Skipping them keeps the loop rate.
+check("side sensors are not fitted for this demo", M.SONARS_FITTED == ("front",))
+_u = M.Ultrasonics(enabled=False)
+_u.sensors = {"front": object()}
+_seq = []
+for _ in range(6):
+    for _ in range(len(_u.ORDER)):
+        _nm = _u.ORDER[_u._i % len(_u.ORDER)]; _u._i += 1
+        if _nm in _u.sensors: break
+    _seq.append(_nm)
+check("every tick reads the front, none wasted on absent sensors",
+      _seq == ["front"] * 6)
 
 print("13) a blurred frame is not the victim disappearing")
 # classify_frame() returns None on a motion-blurred frame, which is NOT an empty
