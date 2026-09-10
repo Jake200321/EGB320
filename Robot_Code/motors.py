@@ -47,8 +47,8 @@ MAX_WHEEL_RPM = 200.0               # MEASURE -- output-shaft RPM at MAX_SPEED_R
 #
 # Find out with:  python3 motor_spin_test.py
 # Encoder counts are flipped by the same sign, so forward always counts up.
-LEFT_SIGN = 1
-RIGHT_SIGN = 1
+LEFT_SIGN = -1
+RIGHT_SIGN = -1
 # -------------------------------------------------------------------------------
 
 SPEED_LIMIT = 127                   # the board's hard limit
