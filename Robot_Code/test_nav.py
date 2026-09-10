@@ -462,6 +462,23 @@ for _swap in (False, True):
         check("SWAP_MOTORS mirrors the encoder channels too",
               _t2 == (_unswapped_ticks[1], _unswapped_ticks[0]))
 MOT.SWAP_MOTORS = _was
+
+# Track trim, for a robot that pulls to one side.
+_trims = (MOT.LEFT_TRIM, MOT.RIGHT_TRIM)
+def _tracks(fb):
+    return (fb.sent[1], fb.sent[0]) if MOT.SWAP_MOTORS else fb.sent
+MOT.LEFT_TRIM, MOT.RIGHT_TRIM = 1.0, 1.0
+_fb3 = _FakeBoard(); MOT.MotorDriver(controller=_fb3).set_raw(80, 80)
+_base = _tracks(_fb3)
+check("untrimmed, both tracks get the same", _base[0] == _base[1])
+MOT.LEFT_TRIM = 1.10
+_fb4 = _FakeBoard(); MOT.MotorDriver(controller=_fb4).set_raw(80, 80)
+_trimmed = _tracks(_fb4)
+check("LEFT_TRIM drives the LEFT track harder",
+      abs(_trimmed[0]) > abs(_base[0]) and abs(_trimmed[1]) == abs(_base[1]))
+check("trim lands on the track, not the board channel -- survives SWAP_MOTORS",
+      abs(_trimmed[0]) == round(abs(_base[0]) * 1.10))
+MOT.LEFT_TRIM, MOT.RIGHT_TRIM = _trims
 check("reverse is negative", MOT.to_raw(-0.10) < 0)
 check("magnitude matches forward", abs(MOT.to_raw(-0.10)) == MOT.to_raw(0.10))
 check("board address is the unit's, not the DFRobot one",

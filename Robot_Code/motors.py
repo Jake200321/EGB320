@@ -65,6 +65,25 @@ RIGHT_SIGN = -1
 # command -- it only shows up the moment the robot tries to turn. It also inverts the
 # encoder straight-line correction, which then steers further off instead of back.
 SWAP_MOTORS = True
+
+# ---- TRACK TRIM -- fix a robot that pulls to one side -------------------------
+# Per-track multipliers on every command. Raise one, or lower the other, until it
+# runs straight. 1.0 is untrimmed.
+#
+#   pulls RIGHT (left track weaker) -> raise LEFT_TRIM,  e.g. 1.08
+#   pulls LEFT  (right track weaker) -> raise RIGHT_TRIM
+#
+# Prefer LOWERING the strong side over raising the weak one. At full speed the
+# strong track is already at 127 and there is no headroom to add -- raising the
+# weak side then does nothing at all, and only the trim on the fast track has any
+# effect. Trimming down always works.
+#
+# This is for the open-loop stretches -- the blind run-in, and the approach once
+# the heading is locked -- where nothing is correcting. While exploring, the
+# encoder straight-line correction already compensates for a track imbalance, so
+# a trim there just reduces how hard it has to work.
+LEFT_TRIM = 1.0
+RIGHT_TRIM = 1.0
 # -------------------------------------------------------------------------------
 
 SPEED_LIMIT = 127                   # the board's hard limit
@@ -208,9 +227,15 @@ class MotorDriver:
         self.set_raw(to_raw(left, self.max_speed), to_raw(right, self.max_speed))
 
     def set_raw(self, left, right):
-        """Applies LEFT_SIGN / RIGHT_SIGN and SWAP_MOTORS, so callers always mean
-        'positive = forward' on the track they named."""
-        left, right = int(left) * LEFT_SIGN, int(right) * RIGHT_SIGN
+        """Applies trim, then LEFT_SIGN / RIGHT_SIGN, then SWAP_MOTORS, so callers
+        always mean 'positive = forward' on the track they named.
+
+        Trim goes first, while left/right still refer to physical tracks -- after the
+        swap they're board channels, and trimming there would land on the wrong one.
+        """
+        left = int(round(left * LEFT_TRIM))
+        right = int(round(right * RIGHT_TRIM))
+        left, right = left * LEFT_SIGN, right * RIGHT_SIGN
         if SWAP_MOTORS:
             left, right = right, left
         self.last = (left, right)
