@@ -49,9 +49,12 @@ class FakeSonar:
     def __init__(self, front=None, available=True):
         self.front = front; self.available = available
         self.sensors = {"front": 1} if available else {}
-    def update(self): pass
+        self._n = 0
+    def update(self): self._n += 1
     def get(self, name): return self.front if name == "front" else None
-    def walls(self): return (None, None)
+    def since(self, name, t):
+        return (True, self.front) if name in self.sensors else (False, None)
+    def stamp(self, name): return self._n if name in self.sensors else None
 
 
 NO_SONAR = FakeSonar(available=False)
@@ -73,70 +76,72 @@ def run(nav, ticks):
         nav.step()
 
 
-# --------------------------------------------------------------------- tests
-print("1) EXPLORING drives straight ahead with green off")
-d, l = FakeDrive(), FakeLeds()
-run(M.Nav(d, FakeVision([None] * 3), l, FakeSonar(front=1.0)), 3)
-check("driving forward", d.last[0] == M.SEARCH_SPEED)
-check("dead straight with no encoder error", d.last[1] == 0.0)
-check("green off", l.g is False)
+def A(drive, vision, leds, sonar):
+    """A Nav already in APPROACH -- for testing the steer-by-eye controller itself.
+    From SEARCH, a victim it can range goes to SEEK instead (see 2)."""
+    n = M.Nav(drive, vision, leds, sonar)
+    n._enter(M.APPROACH)
+    return n
 
-print("1a) the encoders hold it straight")
-d = FakeDrive(ticks=(0, 0))
-n = M.Nav(d, FakeVision([None] * 20), FakeLeds(), FakeSonar(front=1.0))
-n.step()                                   # first tick sets the reference
+
+# --------------------------------------------------------------------- tests
+print("1) EXPLORING: reads the walls, then drives one cell, yellow on")
+d, l = FakeDrive(ticks=(0, 0)), FakeLeds()
+n = M.Nav(d, FakeVision([None] * 5), l, FakeSonar(front=1.0))
+run(n, 3)
+check("starts in the base cell, facing north", n.cell == M.BASE_CELL and n.facing == 0)
+check("base cell mapped before moving", M.BASE_CELL in n.map.visited)
+check("open ahead is recorded as open", n.map.wall(M.BASE_CELL, 0) is False)
+check("driving forward at SEARCH_SPEED", d.last[0] == M.SEARCH_SPEED)
+check("dead straight with no encoder error", d.last[1] == 0.0)
+check("yellow on, green and red off", l.y is True and l.g is False and l.r is False)
+
+print("1a) the encoders hold it straight -- neither track falls behind")
 d.ticks = (500, 500)                       # both tracks equal
 n.step()
-check("tracks equal -> no correction", d.last[1] == 0.0)
-d.ticks = (600, 500)                       # left ran ahead: veered RIGHT
+check("tracks equal -> no correction", abs(d.last[1]) < 1e-9)
+d.ticks = (700, 500)                       # left ran ahead: veered RIGHT
 n.step()
 check("veering right -> turns LEFT to correct", d.last[1] > 0)
-d.ticks = (500, 600)                       # right ran ahead: veered LEFT
+d.ticks = (700, 900)                       # right caught up and passed: veered LEFT
 n.step()
 check("veering left -> turns RIGHT to correct", d.last[1] < 0)
-d.ticks = (99999, 0)                       # absurd error
+d.ticks = (99999, 900)                     # absurd error
 n.step()
-check("correction is capped", abs(d.last[1]) <= M.MAX_STRAIGHT_CORRECTION)
-check("still driving forward while correcting", d.last[0] == M.SEARCH_SPEED)
+check("correction is capped", abs(d.last[1]) <= M.MAX_STEER_RATE)
+check("still driving forward while correcting", d.last[0] > 0)
 
-print("1b) no encoders -> open-loop straight, not a crash")
+print("1b) no encoders -> still drives, open loop, rather than crashing")
 d = FakeDrive(ticks=None)
 run(M.Nav(d, FakeVision([None] * 3), FakeLeds(), FakeSonar(front=1.0)), 3)
 check("still drives forward", d.last == (M.SEARCH_SPEED, 0.0))
 
-print("1c) a wall ahead turns on the spot, with hysteresis")
-d, son = FakeDrive(ticks=(0, 0)), FakeSonar(front=1.0)
-n = M.Nav(d, FakeVision([None] * 30), FakeLeds(), son)
-n.step()
-son.front = 0.08                           # wall
-n.step()
+print("1c) a wall ahead: turns on the spot to an open side")
+d = FakeDrive(ticks=(0, 0))
+n = M.Nav(d, FakeVision([None] * 5), FakeLeds(), FakeSonar(front=0.04))
+run(n, 3)
+check("wall ahead is mapped", n.map.wall(M.BASE_CELL, 0) is True)
 check("stops driving and spins", d.last[0] == 0.0 and d.last[1] != 0.0)
-check("turns RIGHT at a wall (clockwise = negative yaw)", d.last[1] < 0)
+check("turns RIGHT, the only way out of the SW corner", d.last[1] < 0)
 check("hard enough to pivot a tracked chassis", abs(d.last[1]) >= M.MIN_TURN_RATE_PIVOT)
-son.front = 0.20                           # clearing, but not clear enough yet
-n.step()
-check("keeps turning below TURN_CLEAR_M", d.last[0] == 0.0)
-n.turn_started = time.monotonic() - (M.TURN_DURATION_S + 0.05)   # that turn finished
-n.step()
-check("still blocked after one turn -> takes another", d.last[0] == 0.0)
-son.front = 0.50                           # clear
-n.turn_started = time.monotonic() - (M.TURN_DURATION_S + 0.05)
-n.step(); n.step()
-check("resumes driving once clear", d.last[0] == M.SEARCH_SPEED)
-
-print("1d) the wall turn is a tank turn, and lasts TURN_DURATION_S")
-d, son = FakeDrive(ticks=(0, 0)), FakeSonar(front=1.0)
-n = M.Nav(d, FakeVision([None] * 30), FakeLeds(), son)
-n.step()
-son.front = 0.05
-n.step()
 _l, _r = MOT.wheel_speeds(*d.last)
-check("tracks counter-rotate (one forward, one back)", _l * _r < 0)
-check("no net forward motion", abs(_l + _r) < 1e-9)
-check("turning right", d.last[1] < 0)
-n.step(); n.step()
-check("holds the turn for the full duration", d.last[0] == 0.0)
-check("turn amount is time-based and adjustable", M.TURN_DURATION_S > 0)
+check("a tank turn: tracks counter-rotate", _l * _r < 0 and abs(_l + _r) < 1e-9)
+
+print("1d) centring: off to one side, it aims back to the middle")
+class _Sides(FakeSonar):
+    def __init__(self, left, right):
+        super().__init__(front=1.0); self.l, self.r = left, right
+        self.sensors = {"front": 1, "left": 1, "right": 1}
+    def get(self, name):
+        return {"front": self.front, "left": self.l, "right": self.r}[name]
+for left, right, want, why in [(0.08, 0.02, 1, "close to the right wall -> steers LEFT"),
+                               (0.02, 0.08, -1, "close to the left wall -> steers RIGHT"),
+                               (0.05, 0.05, 0, "centred -> straight")]:
+    d = FakeDrive(ticks=(0, 0))
+    n = M.Nav(d, FakeVision([None] * 5), FakeLeds(), _Sides(left, right))
+    run(n, 3)
+    got = 0 if abs(d.last[1]) < 1e-6 else (1 if d.last[1] > 0 else -1)
+    check(why, got == want and d.last[0] > 0)
 
 print("2) one frame doesn't commit; DETECTION_DEBOUNCE frames do")
 d, l = FakeDrive(), FakeLeds()
@@ -144,7 +149,9 @@ n = M.Nav(d, FakeVision([V(), None, V(), V(), V()]), l, FakeSonar(front=0.5))
 n.step()
 check("still SEARCH after a single hit", n.state == M.SEARCH)
 run(n, 4)
-check("APPROACH once debounced", n.state == M.APPROACH)
+check("once debounced, it places the victim and goes to it (SEEK)", n.state == M.SEEK)
+check("...in the cell straight ahead, from the sonar range",
+      n.victim_cell == n.map.cell_at(*n.map.centre(M.BASE_CELL)) or n.victim_cell == (0, 4))
 check("green ON", l.g is True)
 
 print("2a) approach holds heading to within HEADING_TOLERANCE_DEG")
@@ -168,26 +175,26 @@ check("symmetric", M.heading_correction(7.0) == -M.heading_correction(-7.0))
 
 print("2b) badly off heading, it turns on the spot rather than driving off course")
 d = FakeDrive()
-run(M.Nav(d, FakeVision([V(bearing=35.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
+run(A(d, FakeVision([V(bearing=35.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
 check("no forward motion while way off heading", d.last[0] == 0.0)
 check("turning towards it", d.last[1] < 0)
 check("hard enough to actually pivot", abs(d.last[1]) >= M.MIN_TURN_RATE_PIVOT)
 d = FakeDrive()
-run(M.Nav(d, FakeVision([V(bearing=15.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
+run(A(d, FakeVision([V(bearing=15.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
 check("15 deg: outside the sonar's trust cone, so it pivots to centre first",
       d.last[0] == 0.0 and abs(d.last[1]) >= M.MIN_TURN_RATE_PIVOT)
 d = FakeDrive()
-run(M.Nav(d, FakeVision([V(bearing=8.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
+run(A(d, FakeVision([V(bearing=8.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
 check("8 deg: sonar believed, so it corrects while rolling",
       d.last[0] > 0 and d.last[1] < 0)
 check("...and gently, not at the pivot floor", abs(d.last[1]) < M.MIN_TURN_RATE_PIVOT)
 d = FakeDrive()
-run(M.Nav(d, FakeVision([V(bearing=0.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
+run(A(d, FakeVision([V(bearing=0.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
 check("lined up -> drives, no correction", d.last[0] > 0 and d.last[1] == 0.0)
 
 print("2c) heading locks inside HEADING_LOCK_DEG and then drives straight")
 d, l = FakeDrive(), FakeLeds()
-n = M.Nav(d, FakeVision([V(bearing=3.0)] * 8), l, FakeSonar(front=0.5))
+n = A(d, FakeVision([V(bearing=3.0)] * 8), l, FakeSonar(front=0.5))
 run(n, 6)
 check("locked once inside the lock angle", n.heading_locked is True)
 check("stops steering entirely", d.last[1] == 0.0)
@@ -208,54 +215,55 @@ check("steering again", d.last[1] != 0.0)
 
 print("2c-iv) the lock is dropped when the approach restarts")
 d2, l2 = FakeDrive(), FakeLeds()
-n2 = M.Nav(d2, FakeVision([V()] * 4 + [None] * 20 + [V()] * 6), l2, FakeSonar(front=0.9))
+n2 = A(d2, FakeVision([V()] * 4 + [None] * 20 + [V()] * 6), l2, FakeSonar(front=0.9))
 run(n2, 5)
 check("locked during the first approach", n2.heading_locked is True)
 run(n2, 20)
 check("victim lost -> SEARCH", n2.state == M.SEARCH)
 check("lock cleared", n2.heading_locked is False)
 
-print("2d) entering an approach must not clear the LEDs")
+print("2d) the approach keeps the green LED on")
 d3, l3 = FakeDrive(), FakeLeds()
-n3 = M.Nav(d3, FakeVision([V()] * 6), l3, FakeSonar(front=0.5))
+n3 = A(d3, FakeVision([V()] * 6), l3, FakeSonar(front=0.5))
 run(n3, 5)
-check("green stays on through the SEARCH -> APPROACH transition", l3.g is True)
+check("green stays on through the approach", l3.g is True)
 
 print("3) approach steers the right way (+bearing = right = negative yaw)")
 # Bearing inside HEADING_COARSE_DEG so it drives while correcting (2b covers the
 # turn-on-the-spot case) and inside US_TRUST_BEARING_DEG so the sonar is believed.
 d = FakeDrive()
-run(M.Nav(d, FakeVision([V(bearing=8.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
+run(A(d, FakeVision([V(bearing=8.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
 check("driving forward", d.last[0] > 0)
 check("yaw negative for a victim to the right", d.last[1] < 0)
 d = FakeDrive()
-run(M.Nav(d, FakeVision([V(bearing=-8.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
+run(A(d, FakeVision([V(bearing=-8.0)] * 5), FakeLeds(), FakeSonar(front=0.5)), 5)
 check("yaw positive for a victim to the left", d.last[1] > 0)
 
 print("4) creeps when close")
 d1 = FakeDrive()
-run(M.Nav(d1, FakeVision([V()] * 4), FakeLeds(), FakeSonar(front=0.50)), 4)
+run(A(d1, FakeVision([V()] * 4), FakeLeds(), FakeSonar(front=0.50)), 4)
 d2 = FakeDrive()
-run(M.Nav(d2, FakeVision([V()] * 4), FakeLeds(), FakeSonar(front=0.20)), 4)
+run(A(d2, FakeVision([V()] * 4), FakeLeds(), FakeSonar(front=0.20)), 4)
 check("slower inside CREEP_RANGE_M", d2.last[0] < d1.last[0])
 
-print("5) stops 10 cm short and flashes yellow")
+print("5) stops 10 cm short, green on while collecting, then home with red")
 d, l, son = FakeDrive(), FakeLeds(), FakeSonar(front=0.50)
-n = M.Nav(d, FakeVision([V()] * 50), l, son)
+n = A(d, FakeVision([V()] * 50), l, son)
 run(n, 4)
 check("approaching", n.state == M.APPROACH)
 son.front = 0.11
 n.step()
 check("AT_VICTIM at 11 cm", n.state == M.AT_VICTIM)
 check("motors stopped", d.last == (0.0, 0.0))
-for _ in range(40):
-    n.step(); time.sleep(0.012)
-check("yellow actually toggled", True in l.ylog and False in l.ylog)
-check("green stays on", l.g is True)
+check("green on, yellow off while collecting", l.g is True and l.y is False)
+n.rescue.started = time.monotonic() - (M.RESCUE_TIME_S + 0.1)
+n.step()
+check("collected -> RETURN", n.state == M.RETURN and n.carrying)
+check("red on, green off on the way home", l.r is True and l.g is False and l.y is False)
 
 print("6) losing the victim returns to SEARCH")
 d, l = FakeDrive(), FakeLeds()
-n = M.Nav(d, FakeVision([V()] * 3 + [None] * 12), l, FakeSonar(front=0.5))
+n = A(d, FakeVision([V()] * 3 + [None] * 12), l, FakeSonar(front=0.5))
 run(n, 15)
 check("back to SEARCH", n.state == M.SEARCH)
 check("green off again", l.g is False)
@@ -272,13 +280,12 @@ print("8) the front sonar alone is enough -- no camera geometry needed")
 d = FakeDrive()
 n = M.Nav(d, FakeVision([V()] * 6, geometry_ok=False), FakeLeds(), FakeSonar(front=0.50))
 run(n, 6)
-check("reaches APPROACH on sonar alone", n.state == M.APPROACH)
-check("driving forward", d.last[0] > 0)
+check("places the victim and goes for it on sonar range alone", n.state == M.SEEK)
 check("range came from the sonar", n.victim_range()[1] == "sonar")
 
 print("9) sonar is not believed when the victim is off to one side")
 d = FakeDrive()
-n = M.Nav(d, FakeVision([V(bearing=30.0)] * 6, geometry_ok=False), FakeLeds(),
+n = A(d, FakeVision([V(bearing=30.0)] * 6, geometry_ok=False), FakeLeds(),
           FakeSonar(front=0.50))
 run(n, 6)
 check("claims no distance off-axis", n.victim_range()[0] is None)
@@ -307,7 +314,7 @@ check("uses the camera's number, not the sonar's", abs(dist - 0.40) < 1e-9)
 
 print("12) echo lost mid-approach: halt rather than coast on a stale range")
 d, son = FakeDrive(), FakeSonar(front=0.50)
-n = M.Nav(d, FakeVision([V()] * 20, geometry_ok=False), FakeLeds(), son)
+n = A(d, FakeVision([V()] * 20, geometry_ok=False), FakeLeds(), son)
 run(n, 4)
 son.front = None
 n.step()
@@ -318,7 +325,7 @@ print("12a) losing sight of the victim close up commits to a sonar run-in")
 # At 10 cm camera height the victim leaves the frame around 27 cm out. That must not
 # read as "victim lost" -- it's the moment the approach is most nearly finished.
 d, l, son = FakeDrive(), FakeLeds(), FakeSonar(front=0.25)
-n = M.Nav(d, FakeVision([V()] * 3 + [None] * 20), l, son)
+n = A(d, FakeVision([V()] * 3 + [None] * 20), l, son)
 run(n, 4)
 check("approaching first", n.state == M.APPROACH)
 run(n, 12)                                     # victim disappears under the camera
@@ -335,14 +342,14 @@ for front, bearing, why in [(0.80, 0.0, "too far to be the under-camera case"),
                             (0.25, 40.0, "off to one side, not lined up"),
                             (None, 0.0, "no sonar range at all")]:
     d2, l2 = FakeDrive(), FakeLeds()
-    n2 = M.Nav(d2, FakeVision([V(bearing=bearing)] * 3 + [None] * 20), l2,
+    n2 = A(d2, FakeVision([V(bearing=bearing)] * 3 + [None] * 20), l2,
                FakeSonar(front=front))
     run(n2, 16)
     check(f"{why} -> back to SEARCH", n2.state == M.SEARCH)
 
 print("12a-iii) the blind run-in gives up rather than driving forever")
 d3 = FakeDrive()
-n3 = M.Nav(d3, FakeVision([V()] * 3 + [None] * 40), FakeLeds(), FakeSonar(front=0.25))
+n3 = A(d3, FakeVision([V()] * 3 + [None] * 40), FakeLeds(), FakeSonar(front=0.25))
 run(n3, 16)
 check("in CLOSING", n3.state == M.CLOSING)
 n3.closing_since = time.monotonic() - (M.CLOSING_TIMEOUT_S + 0.1)
@@ -352,7 +359,7 @@ check("stopped", d3.last == (0.0, 0.0))
 
 print("12a-iv) no range mid-run-in: hold, don't drive on faith")
 d4, son4 = FakeDrive(), FakeSonar(front=0.25)
-n4 = M.Nav(d4, FakeVision([V()] * 3 + [None] * 40), FakeLeds(), son4)
+n4 = A(d4, FakeVision([V()] * 3 + [None] * 40), FakeLeds(), son4)
 run(n4, 16)
 son4.front = None
 n4.step()
@@ -364,25 +371,39 @@ _b = M.camera_blind_range_m()
 check("blind range is derived, not hardcoded", _b is not None and 0.2 < _b < 0.35)
 check("handover starts before the camera goes blind", M.CLOSING_TRIGGER_M > _b)
 
-print("12b) rescue times out after RESCUE_TIMEOUT_S and stops with red")
+print("12b) collecting waits for the mechanism; releasing at base counts the rescue")
 d, l, son = FakeDrive(), FakeLeds(), FakeSonar(front=0.11)
-n = M.Nav(d, FakeVision([V()] * 400), l, son)
-run(n, 4)
+n = A(d, FakeVision([V()] * 400), l, son)
+run(n, 2)
 check("reached AT_VICTIM", n.state == M.AT_VICTIM)
-n.arrived_at = time.monotonic() - (M.RESCUE_TIMEOUT_S - 0.2)   # just short of the timeout
+n.rescue.started = time.monotonic() - (M.RESCUE_TIME_S - 0.2)
 n.step()
-check("still rescuing just before the timeout", n.state == M.AT_VICTIM)
-n.arrived_at = time.monotonic() - (M.RESCUE_TIMEOUT_S + 0.1)   # just past it
+check("still collecting until the mechanism says done", n.state == M.AT_VICTIM)
+n.rescue.started = time.monotonic() - (M.RESCUE_TIME_S + 0.1)
 n.step()
-check("DONE once the timeout passes", n.state == M.DONE)
-check("motors stopped", d.last == (0.0, 0.0))
-check("red LED on", l.r is True)
-check("green off", l.g is False)
-check("yellow off", l.y is False)
-run(n, 40)
+check("then RETURN, carrying", n.state == M.RETURN and n.carrying)
+n._enter(M.AT_BASE)
+check("red stays on while releasing", l.r is True)
+n.release.started = time.monotonic() - (M.RELEASE_TIME_S + 0.1)
+n.step()
+check("released -> counted, back out exploring", n.rescued == 1 and n.state == M.SEARCH)
+check("yellow again, red off", l.y is True and l.r is False)
+n.rescued = M.VICTIMS_TOTAL - 1
+n._enter(M.AT_BASE); n.carrying = True
+n.release.started = time.monotonic() - (M.RELEASE_TIME_S + 0.1)
+n.step()
+check("the last one home -> DONE", n.state == M.DONE)
+check("motors stopped, LEDs off", d.last == (0.0, 0.0) and not (l.g or l.y or l.r))
+run(n, 20)
 check("stays DONE -- terminal, even with a victim in view", n.state == M.DONE)
-check("red stays on", l.r is True)
-check("motors stay stopped", d.last == (0.0, 0.0))
+
+print("12b-ii) the 7-minute limit stops it wherever it is")
+d, l = FakeDrive(ticks=(0, 0)), FakeLeds()
+n = M.Nav(d, FakeVision([None] * 10), l, FakeSonar(front=1.0))
+run(n, 2)
+n.mission_start = time.monotonic() - M.MISSION_TIME_S - 1
+n.step()
+check("DONE at the time limit", n.state == M.DONE and d.last == (0.0, 0.0))
 
 print("12c) motors.py maths: differential drive and raw-speed mapping")
 import motors as MOT
@@ -487,7 +508,7 @@ check("board address is the unit's, not the DFRobot one",
 print("12d) only fitted sonars are pinged")
 # A sensor that isn't wired still costs a full echo timeout every time its turn
 # comes round -- ~22 ms against a 50 ms tick. Skipping them keeps the loop rate.
-check("side sensors are not fitted for this demo", M.SONARS_FITTED == ("front",))
+check("all three sonars are fitted for the maze", set(M.SONARS_FITTED) == {"front", "left", "right"})
 _u = M.Ultrasonics(enabled=False)
 _u.sensors = {"front": object()}
 _seq = []
@@ -496,7 +517,7 @@ for _ in range(6):
         _nm = _u.ORDER[_u._i % len(_u.ORDER)]; _u._i += 1
         if _nm in _u.sensors: break
     _seq.append(_nm)
-check("every tick reads the front, none wasted on absent sensors",
+check("with only the front plugged in, every tick reads it, none wasted",
       _seq == ["front"] * 6)
 
 print("13) a blurred frame is not the victim disappearing")
@@ -504,7 +525,7 @@ print("13) a blurred frame is not the victim disappearing")
 # result. Nav must hold what it knows rather than counting it as a miss -- otherwise
 # a fast pan looks identical to the victim vanishing.
 d, l, son = FakeDrive(), FakeLeds(), FakeSonar(front=0.50)
-n = M.Nav(d, FakeVision([V()] * 3 + [M.UNUSABLE] * 60), l, son)
+n = A(d, FakeVision([V()] * 3 + [M.UNUSABLE] * 60), l, son)
 run(n, 4)
 check("approaching before the blur", n.state == M.APPROACH)
 run(n, 30)                                  # far more than LOST_GRACE_FRAMES
@@ -514,7 +535,7 @@ check("misses not counted", n.misses == 0)
 
 print("14) a genuinely empty frame still loses the victim")
 d, l = FakeDrive(), FakeLeds()
-n = M.Nav(d, FakeVision([V()] * 3 + [None] * 12), l, FakeSonar(front=0.50))
+n = A(d, FakeVision([V()] * 3 + [None] * 12), l, FakeSonar(front=0.50))
 run(n, 15)
 check("empty frames DO drop to SEARCH", n.state == M.SEARCH)
 

@@ -12,3 +12,6 @@ vision/templates/
 
 # backup written by Robot_Code/tune_class_colour.py
 vision/profiles.pkl.bak
+
+# maps saved by main.py and test_maze.py --png
+Robot_Code/runs/
