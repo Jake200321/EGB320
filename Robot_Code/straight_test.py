@@ -2,7 +2,7 @@
 
     python3 straight_test.py                # all three steps, ~2.5 s of driving each
     python3 straight_test.py --seconds 3    # longer runs
-    python3 straight_test.py --only 2       # just one step (1, 2 or 3)
+    python3 straight_test.py --only 4       # just one step (1-4)
 
 Give it a metre or more of clear floor ahead. It asks before every run.
 
@@ -15,6 +15,10 @@ Give it a metre or more of clear floor ahead. It asks before every run.
   3. HEADING HOLD -- the same drive with the encoder heading hold the maze nav uses.
      Reports how far the heading wandered. If this is worse than step 2, the controller
      is the problem rather than the motors.
+  4. SPEED CURVE -- each raw motor command in turn (forward, then back, so it stays put),
+     with the speed the encoders actually measured. This is what the controller's idea of
+     "0.13 m/s" or "turn at 0.8 rad/s" has to match; when it doesn't, every correction the
+     nav asks for comes out too weak or too strong.
 
 Nothing here edits a file: it prints the lines to change.
 """
@@ -69,6 +73,15 @@ def step1_steering(drive, odo, seconds, ticks_per_m):
     r = drive_run(drive, odo, 1.0, 0.10, lambda o: 0.8, "steer left")
     print(f"   left track {r['dl']} ticks, right track {r['dr']} ticks; "
           f"odometry heading {r['heading']:+.1f} deg (should be +, i.e. turned left)")
+    asked = math.degrees(0.8 * 1.0)
+    got = max(r["heading"], 0.0)
+    pct = 100.0 * got / asked
+    print(f"   steering authority: asked for {asked:.0f} deg of turn, got {r['heading']:+.1f} deg "
+          f"({pct:.0f}%)")
+    if pct < 40:
+        print(f"   !! Only {pct:.0f}% of the steering the controller asks for happens, so every "
+              "correction (centring, heading hold) is that much weaker\n      than it thinks -- "
+              "sluggish to react, slow to recover. Run step 4 to see the speed curve behind it.")
     if r["dl"] <= 0 or r["dr"] <= 0:
         print("   !! A track counted DOWN while driving forward. Fix the encoder signs "
               "(ENCODER_LEFT_SIGN / ENCODER_RIGHT_SIGN in motors.py) -- both must count up.")
@@ -133,6 +146,39 @@ def step3_hold(drive, odo, seconds, ticks_per_m, v, gain, max_rate):
     return r
 
 
+SPEED_CURVE_RAWS = (45, 55, 65, 80, 100, 127)
+
+
+def step4_speed_curve(drive, ticks_per_m, clock=time, raws=SPEED_CURVE_RAWS):
+    """Measured track speed at each raw command, vs what motors.to_raw assumes."""
+    print("\n4) SPEED CURVE -- each raw command for ~1 s, alternating forward / back so it stays put")
+    print("   raw   left m/s  right m/s   code assumes")
+    rows, sign = [], 1
+    for raw in raws:
+        drive.driver.set_raw(sign * raw, sign * raw)
+        clock.sleep(0.4)                                   # spin up
+        a, t0 = drive.read_encoders(), clock.monotonic()
+        clock.sleep(0.6)
+        b, t1 = drive.read_encoders(), clock.monotonic()
+        drive.stop()
+        clock.sleep(0.5)
+        dt = max(t1 - t0, 1e-3)
+        left = (b[0] - a[0]) * sign / dt / ticks_per_m
+        right = (b[1] - a[1]) * sign / dt / ticks_per_m
+        # what to_raw's linear map says this raw is worth
+        top = MOT.MAX_WHEEL_RPM / 60.0 * MOT.SPROCKET_CIRCUM_M
+        assumed = max(0.0, (raw - MOT.MIN_SPEED_RAW) / (MOT.MAX_SPEED_RAW - MOT.MIN_SPEED_RAW)) * top
+        rows.append((raw, left, right, assumed))
+        print(f"   {raw:3d}   {left:7.3f}   {right:7.3f}      {assumed:7.3f}")
+        sign = -sign
+    top_real = max(max(r[1], r[2]) for r in rows)
+    flat = next((r[0] for r in rows if max(r[1], r[2]) >= 0.9 * top_real), rows[-1][0])
+    print(f"   fastest measured {top_real:.3f} m/s; it reaches 90% of that by raw {flat} "
+          "-- steering has to work BELOW that:\n   lowering one track from there is the only "
+          "way to turn, and the controller's linear map doesn't know that.")
+    return rows
+
+
 def ask(prompt):
     try:
         return input(prompt)
@@ -145,7 +191,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__)
     ap.add_argument("--seconds", type=float, default=2.5)
-    ap.add_argument("--only", type=int, choices=(1, 2, 3))
+    ap.add_argument("--only", type=int, choices=(1, 2, 3, 4))
     ap.add_argument("--speed", type=float, default=None, help="m/s (default: the nav's SEARCH_SPEED)")
     args = ap.parse_args()
 
@@ -161,7 +207,7 @@ def main():
     print(f"main.py:   TICKS_PER_M={M.TICKS_PER_M:.0f}  speed {v:.2f} m/s  "
           f"HEADING_HOLD_GAIN={M.HEADING_HOLD_GAIN}  MAX_STEER_RATE={M.MAX_STEER_RATE}")
     try:
-        steps = [args.only] if args.only else [1, 2, 3]
+        steps = [args.only] if args.only else [1, 2, 3, 4]
         for n in steps:
             ask(f"\nStep {n}: robot on clear floor, facing a metre or more of space. Enter to go... ")
             if n == 1:
@@ -172,6 +218,8 @@ def main():
                     break
             elif n == 2:
                 step2_open_loop(drive, odo, args.seconds, M.TICKS_PER_M, v)
+            elif n == 4:
+                step4_speed_curve(drive, M.TICKS_PER_M)
             else:
                 step3_hold(drive, odo, args.seconds, M.TICKS_PER_M, v,
                            M.HEADING_HOLD_GAIN, M.MAX_STEER_RATE)

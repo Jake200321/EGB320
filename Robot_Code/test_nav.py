@@ -1052,6 +1052,42 @@ r2 = ST.drive_run(drive, odo, 2.5, 0.13,
 check("...and the heading hold pulls it back to within a few degrees",
       abs(r2["heading"]) < 3 and r2["peak"] < abs(r["heading"]))
 
+class _Board(_Tracks):
+    """_Tracks plus the .driver.set_raw the speed-curve step drives. Speed saturates, like
+    the real motors seem to: it climbs to raw 60, then barely changes."""
+    def __init__(self, clock):
+        super().__init__(clock)
+        self.driver = self
+    def set_raw(self, left, right):
+        def mps(raw):
+            return math.copysign(min(abs(raw), 60) / 60 * 0.26 + (max(abs(raw), 60) - 60) * 0.0002, raw)
+        self.l_v, self.r_v = mps(left), mps(right)
+    def advance(self, dt):
+        self.l += getattr(self, "l_v", 0.0) * dt * M.TICKS_PER_M
+        self.r += getattr(self, "r_v", 0.0) * dt * M.TICKS_PER_M
+    def stop(self): self.l_v = self.r_v = 0.0
+
+
+import io, contextlib
+_clock = _Clock(); _board = _Board(_clock); _clock.on_sleep = _board.advance
+_buf = io.StringIO()
+with contextlib.redirect_stdout(_buf):
+    _rows = ST.step4_speed_curve(_board, M.TICKS_PER_M, _clock)
+check("speed curve: one row per raw command, measured speeds positive in both directions",
+      len(_rows) == len(ST.SPEED_CURVE_RAWS) and all(r[1] > 0 and r[2] > 0 for r in _rows))
+check("...and it reports where the speed stops responding (steering has to work below that)",
+      "reaches 90%" in _buf.getvalue())
+_clock = _Clock(); _tr = _Tracks(_clock, gain_l=1.0, gain_r=1.0)
+_buf = io.StringIO()
+with contextlib.redirect_stdout(_buf):
+    _real = ST.drive_run
+    ST.drive_run = lambda d, o, sec, v, st, label, clock=_clock: _real(d, o, sec, v, st, label, clock)
+    try:
+        ST.step1_steering(_tr, M.Odometry(M.TICKS_PER_M, M.EFFECTIVE_TRACK_M), 2.5, M.TICKS_PER_M)
+    finally:
+        ST.drive_run = _real
+check("step 1 reports steering authority as a percentage", "steering authority" in _buf.getvalue())
+
 print("26) --no-centring drives on the encoder heading alone")
 n = M.Nav(LogDrive(), FakeVision([None]), FakeLeds(), _Sides(0.14, 0.02))   # wall hard on the right
 n.odo.theta = M.HEADING_RAD[0]
