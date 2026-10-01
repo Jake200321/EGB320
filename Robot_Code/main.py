@@ -45,6 +45,7 @@ at a made-up number.
 import argparse
 import math
 import os
+import shutil
 import sys
 import time
 
@@ -216,6 +217,13 @@ CAMERA_WALL_WEIGHT = 0.7    # camera's share of the centring offset when both ag
 CAMERA_AGREE_M = 0.03       # ...agree = within this; further apart, trust the sonars
 CAMERA_FRESH_S = 0.30       # a wall view older than this is ignored
 CAMERA_WALL_TOLERANCE_M = 0.04  # camera wall is "this cell's" within half a cell + this
+# The camera can ADD a wall the sonar missed (no echo, or a reading only just outside
+# the wall window), but never over a sonar that sees clear space well beyond it: a
+# front sonar reading 67 cm cannot have a wall 14 cm ahead. Past this slack beyond
+# the wall window, the sonar's "open" stands and the disagreement is logged.
+CAMERA_SONAR_SLACK_M = 0.06
+CAMERA_DISAGREE_TICKS = 15  # camera says "wall right ahead" against a clear front
+                            # sonar for this many frames in a row -> warn once
 # The walls are on the maze grid, so the angle the camera measures against them IS the
 # heading error -- measured, where the encoders only integrate it and drift. While
 # driving, the heading estimate is pulled this far towards it per fresh frame:
@@ -365,6 +373,10 @@ class StatusLine:
     def update(self, text):
         if not self.enabled:
             return
+        try:
+            text = text[:max(20, shutil.get_terminal_size().columns - 1)]   # never wrap
+        except OSError:
+            pass
         pad = max(0, self._width - len(text))
         print("\r" + text + " " * pad, end="", flush=True)
         self._width = len(text)
@@ -415,9 +427,9 @@ def status_text(nav, sonar, leds, hz):
                   for n, c in (("green", "G"), ("yellow", "Y"), ("red", "R")))
     cell = getattr(nav, "cell", None)
     where = "" if cell is None else f"{cell}{HEADING_NAME[nav.facing]} "
-    return (f"{state:<19}| {where}{target:<38}| "
-            f"{vision_summary(getattr(nav, 'vision', None))}"
-            f" | {sonar_txt} | {lit} | {hz:4.1f}Hz")
+    # Most useful first: StatusLine cuts to the terminal width, so what's last goes first.
+    return (f"{state:<19}| {where}{target:<38}| {sonar_txt} | {lit} | {hz:4.1f}Hz | "
+            f"{vision_summary(getattr(nav, 'vision', None))}")
 
 
 def vision_summary(vision):
@@ -1440,6 +1452,7 @@ class Nav:
         self.drive, self.vision, self.leds = drive, vision, leds
         self.wallcam = wall_camera       # wallvision.WallCamera, or None for sonar only
         self.cam_walls = None            # latest wallvision.WallView
+        self._cam_disagree = 0           # consecutive frames the camera contradicted the sonar
         self._wall_frame = None          # the frame it was computed from
         self.sonar = sonar if sonar is not None else Ultrasonics(enabled=False)
         self.state = SEARCH
@@ -1671,10 +1684,38 @@ class Nav:
         self._wall_frame = frame
         try:
             self.cam_walls = self.wallcam.look(frame)
+            self._check_camera_agrees()
         except Exception as exc:                       # noqa: BLE001
             STATUS.event(f"[walls] camera wall detection failed, sonar only -- "
                          f"{type(exc).__name__}: {exc}")
             self.wallcam = self.cam_walls = None
+
+    def _check_camera_agrees(self):
+        """A wall right in front (closer than ~21 cm) can't coexist with a front sonar
+        that reads far. If the camera keeps claiming it, its picture is wrong -- most
+        likely something bright in the bottom of the frame (the robot's own chassis, a
+        glare patch, a white floor marking) -- so say so once."""
+        view, front = self.cam_walls, self.sonar.front
+        if view is not None and view.front_close and front is not None and front > 0.35:
+            self._cam_disagree += 1
+        else:
+            self._cam_disagree = 0
+        if self._cam_disagree == CAMERA_DISAGREE_TICKS:
+            STATUS.event(f"[walls] WARNING: the camera says a wall is right ahead but the front "
+                         f"sonar reads {front*100:.0f}cm -- the camera view is probably catching "
+                         "something bright at the bottom of the frame (chassis? glare?). It's being "
+                         "overruled by the sonar; run  python3 wall_vision_test.py --save  facing "
+                         "down the corridor and check runs/*_mask.png")
+
+    def _camera_summary(self):
+        view = self._camera_view()
+        if view is None:
+            return "no wall view"
+
+        def cm(v):
+            return "--" if v is None else f"{v*100:.0f}"
+        return (f"cam: front {'CLOSE' if view.front_close else cm(view.front_m)}, "
+                f"L {cm(view.left_m)}, R {cm(view.right_m)} cm, {view.columns} boundary pts")
 
     def _camera_view(self):
         """The latest wall view if it's recent enough to act on."""
@@ -1865,9 +1906,14 @@ class Nav:
             if (not present and self._camera_sees_wall(name)
                     and self.map.neighbour(self.cell, heading) != self.victim_cell):
                 shown = "no echo" if d is None else f"{d*100:.0f}cm"
-                STATUS.event(f"[walls] {self.cell} {name}: sonar says open ({shown}), "
-                             "camera sees a wall -- marking it")
-                present = True
+                if d is None or d < at_centre + window + CAMERA_SONAR_SLACK_M:
+                    STATUS.event(f"[walls] {self.cell} {name}: sonar says open ({shown}), "
+                                 "camera sees a wall -- marking it")
+                    present = True
+                else:
+                    STATUS.event(f"[walls] {self.cell} {name}: camera sees a wall but the "
+                                 f"sonar reads {shown} of clear space -- trusting the sonar "
+                                 f"[{self._camera_summary()}]")
             self.map.set_wall(self.cell, heading, present)
         self.map.visited.add(self.cell)
 

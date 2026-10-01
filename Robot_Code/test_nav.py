@@ -900,5 +900,55 @@ _events.clear(); n = stalled_drive(); n.mover.update()
 check("warns once per drive, not every tick", sum("[odo]" in e for e in _events) == 1)
 M.STATUS.event = _orig_event
 
+print("23) the camera never overrules a sonar that sees clear space")
+_ev = []
+_orig_ev = M.STATUS.event
+M.STATUS.event = lambda msg: _ev.append(msg)
+
+
+def sense_front(sonar_front, **view_kw):
+    n = front_nav(sonar_front, **view_kw)
+    n.sense_from = {k: 0.0 for k in ("front", "left", "right")}
+    n._record_walls(["front", "left", "right"])
+    return n
+
+
+n = sense_front(0.67, front_close=True)
+check("sonar reads 67 cm clear, camera claims a wall right ahead -> NO wall marked",
+      n.map.wall(n.cell, 0) is False)
+check("...and the disagreement is logged with the camera's numbers",
+      any("trusting the sonar" in e and "cam:" in e for e in _ev))
+n = sense_front(0.17, front_close=True)
+check("sonar reads 17 cm (just outside the wall window), camera sees a wall -> marked",
+      n.map.wall(n.cell, 0) is True)
+n = sense_front(None, front_close=True)
+check("sonar no echo, camera sees a wall -> marked", n.map.wall(n.cell, 0) is True)
+n = sense_front(0.05, front_close=False)
+check("sonar sees the wall itself -> marked, camera not needed", n.map.wall(n.cell, 0) is True)
+
+# a camera that keeps contradicting the sonar gets reported, once
+_ev.clear()
+n = M.Nav(LogDrive(), FakeVision([None]), FakeLeds(), _Front(0.80), wall_camera=object())
+for _i in range(M.CAMERA_DISAGREE_TICKS + 5):
+    n.cam_walls = view(front_close=True)
+    n._check_camera_agrees()
+check("camera 'wall ahead' vs sonar 80 cm for many frames -> one warning",
+      sum("WARNING: the camera says a wall is right ahead" in e for e in _ev) == 1)
+_ev.clear()
+n = M.Nav(LogDrive(), FakeVision([None]), FakeLeds(), _Front(0.10), wall_camera=object())
+for _i in range(M.CAMERA_DISAGREE_TICKS + 5):
+    n.cam_walls = view(front_close=True)
+    n._check_camera_agrees()
+check("camera and sonar agree there's a wall -> silent", not _ev)
+M.STATUS.event = _orig_ev
+
+# the status line never wraps
+import io, contextlib
+_sl = M.StatusLine(); _buf = io.StringIO()
+with contextlib.redirect_stdout(_buf):
+    _sl.update("x" * 500)
+check("status line is cut to the terminal width", len(_buf.getvalue().strip("\r")) <
+      shutil_cols if (shutil_cols := __import__("shutil").get_terminal_size().columns) else True)
+
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)
