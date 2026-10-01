@@ -453,16 +453,30 @@ class _FakeBoard:
     def standby(s): pass
 
 _fb = _FakeBoard()
-_old = (MOT.LEFT_SIGN, MOT.RIGHT_SIGN)
+_old = (MOT.LEFT_SIGN, MOT.RIGHT_SIGN, MOT.LEFT_TRIM, MOT.RIGHT_TRIM,
+        MOT.ENCODER_LEFT_SIGN, MOT.ENCODER_RIGHT_SIGN)
 MOT.LEFT_SIGN = MOT.RIGHT_SIGN = -1
+MOT.LEFT_TRIM = MOT.RIGHT_TRIM = 1.0
+MOT.ENCODER_LEFT_SIGN = MOT.ENCODER_RIGHT_SIGN = 1
 _d = MOT.MotorDriver(controller=_fb)
 _d.set_raw(50, 50)
 check("LEFT_SIGN/RIGHT_SIGN reach the board", _fb.sent == (-50, -50))
 _fb.raw = (100, 100)                       # counters advanced
 _t = _d.read_encoders()
-check("reversed motors also count forward", _t == (-100, -100) or _t == (100, 100))
-check("...specifically, the sign is applied to ticks too", _t == (-100, -100))
-MOT.LEFT_SIGN, MOT.RIGHT_SIGN = _old
+check("the MOTOR signs don't flip the encoders: a reversed motor's encoder still "
+      "counts forward as up", _t == (100, 100))
+# ...because the encoders have their own signs. On this robot the right motor needs
+# RIGHT_SIGN = -1 but its encoder counts up going forward; flipping it by the motor sign
+# made the odometry see one track going backwards (so: spinning, never arriving).
+_fb.raw = (200, 200)
+MOT.ENCODER_RIGHT_SIGN = -1
+_t = _d.read_encoders()
+check("ENCODER_RIGHT_SIGN flips only the right encoder", _t == (200, 0))
+MOT.LEFT_SIGN, MOT.RIGHT_SIGN, MOT.LEFT_TRIM, MOT.RIGHT_TRIM, \
+    MOT.ENCODER_LEFT_SIGN, MOT.ENCODER_RIGHT_SIGN = _old
+check("shipped encoder signs both count forward as up -- opposite signs would cancel "
+      "to zero forward distance",
+      MOT.ENCODER_LEFT_SIGN == 1 and MOT.ENCODER_RIGHT_SIGN == 1)
 
 # SWAP_MOTORS has to reach the encoders as well as the motors. If it only swapped
 # the commands, the straight-line correction would read the wrong track and steer

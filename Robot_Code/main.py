@@ -145,10 +145,11 @@ VICTIMS_TOTAL = 3           # stop once this many are home
 EXPLORE_PREFER_RIGHT = True
 
 # --- odometry: MEASURE with  python3 main.py --calibrate straight / turn -------
-# Encoder ticks per metre of track travel. 1400 counts per output rev (N20 1:50,
-# x4 quadrature) over a 24 mm sprocket gives 18570 -- if the board counts x2 it's
-# half that. The calibration drive tells you which.
-TICKS_PER_M = 18570.0
+# Encoder ticks per metre of track travel. MEASURED 2026-10-01: 2.5 s straight drive,
+# 7687 ticks (mean of both tracks) over 68 cm -> 11300. (The theoretical 18570 -- 1400
+# counts per output rev over a 24 mm sprocket -- was out by 1.6x.) Re-measure with
+# python3 main.py --calibrate straight if the tracks or the floor change.
+TICKS_PER_M = 11300.0
 # Track width the ODOMETRY uses for heading. Wider than the 123 mm sprocket spacing
 # because the tracks skid sideways to rotate, and the encoders count the full track
 # travel regardless. If 90 degree turns come out short or long, --calibrate turn.
@@ -2403,8 +2404,14 @@ def calibrate(what):
             drive.stop()
             time.sleep(0.3)
             end = drive.read_encoders()
-            ticks = ((end[0] - start[0]) + (end[1] - start[1])) / 2.0
-            print(f"  left {end[0]-start[0]} ticks, right {end[1]-start[1]} ticks")
+            dl, dr = end[0] - start[0], end[1] - start[1]
+            print(f"  left {dl} ticks, right {dr} ticks")
+            if dl * dr < 0:
+                print("\n  !! The two counts have OPPOSITE signs, so driving forward made one "
+                      "encoder count down.\n     Flip that side's ENCODER_LEFT_SIGN / "
+                      "ENCODER_RIGHT_SIGN in motors.py and run this again --\n     "
+                      "otherwise the odometry thinks the robot is spinning, not driving.")
+            ticks = (abs(dl) + abs(dr)) / 2.0
             cm = float(input("How far did it actually go, in cm? "))
             print(f"\nTICKS_PER_M = {ticks / (cm / 100.0):.0f}")
         else:

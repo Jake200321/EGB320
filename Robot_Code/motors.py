@@ -50,9 +50,25 @@ MAX_WHEEL_RPM = 130.0
 #   robot spins instead of driving straight -> the two disagree; flip one
 #
 # Find out with:  python3 motor_spin_test.py
-# Encoder counts are flipped by the same sign, so forward always counts up.
 LEFT_SIGN = 1
 RIGHT_SIGN = -1
+
+# ---- ENCODER DIRECTION -- separate from the motors' ---------------------------
+# Which way each encoder counts when its track drives FORWARD: +1 if the board's count
+# goes up, -1 if it goes down. Forward must count up on BOTH tracks, or the odometry
+# sees a robot spinning on the spot instead of driving (forward distance = the average
+# of the two, so opposite signs cancel to nothing).
+#
+# These are NOT the same as the motor signs: a motor can be mounted reversed (needs
+# -1 above to drive forward) while its encoder, on the same shaft, still counts up.
+# Measured on this robot with  python3 main.py --calibrate straight  while driving
+# forward: left +7689, right +7685 raw, so both are +1 -- the right MOTOR needs
+# RIGHT_SIGN = -1 but its encoder doesn't.
+#
+# Find out with:  python3 main.py --calibrate straight   -- the two tick counts it
+# prints must have the SAME sign. If one is negative, flip that side here.
+ENCODER_LEFT_SIGN = 1
+ENCODER_RIGHT_SIGN = 1
 
 # Set True if the board's two channels are wired to the opposite tracks. Tell it
 # apart from a sign problem by what the robot gets WRONG:
@@ -284,8 +300,8 @@ class MotorDriver:
         dr = _to_i16(now[1] - self._prev[1])
         if SWAP_MOTORS:
             dl, dr = dr, dl
-        self.ticks[0] += dl * LEFT_SIGN
-        self.ticks[1] += dr * RIGHT_SIGN
+        self.ticks[0] += dl * ENCODER_LEFT_SIGN
+        self.ticks[1] += dr * ENCODER_RIGHT_SIGN
         self._prev = now
         return tuple(self.ticks)
 
