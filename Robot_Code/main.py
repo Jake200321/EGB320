@@ -344,6 +344,8 @@ STATUS = StatusLine()
 def status_text(nav, sonar, leds, hz):
     """The live line: what state we're in, what we can see, what the sonar reads."""
     state = STATE_LABEL.get(nav.state, nav.state)
+    if nav.state == "DONE" and getattr(nav, "finish_reason", None):
+        return f"FINISHED: {nav.finish_reason}"
 
     v = nav.victim
     if v is None:
@@ -1288,8 +1290,19 @@ class Nav:
         self.rescue = RescueStub(RESCUE_TIME_S)
         self.release = RescueStub(RELEASE_TIME_S)
         self.mission_start = None
+        self.finish_reason = None    # why it entered DONE -- always set with it
 
     # -- transitions ------------------------------------------------------
+    def _finish(self, reason):
+        """The only way into DONE. Says why, loudly, so a stop is never a mystery."""
+        if self.state == DONE:
+            return
+        self.finish_reason = reason
+        where = f"cell {self.cell}, {len(self.map.visited)} visited, {self.rescued} rescued"
+        STATUS.event(f"[nav] *** FINISHED: {reason} ({where}, "
+                     f"{self.elapsed():.0f}s in) ***")
+        self._enter(DONE)
+
     def _enter(self, state):
         if state == self.state:
             return
@@ -1417,8 +1430,7 @@ class Nav:
         self._localise()
 
         if self.state != DONE and self.elapsed() >= MISSION_TIME_S:
-            STATUS.event(f"[nav] {MISSION_TIME_S:.0f}s up -- stopping")
-            self._enter(DONE)
+            self._finish(f"mission time up ({MISSION_TIME_S:.0f}s)")
 
         seen = self.vision.look()
 
@@ -1712,8 +1724,9 @@ class Nav:
             heading = self.map.next_heading(self.cell, frontier, True, self.facing,
                                             EXPLORE_PREFER_RIGHT)
         if heading is None:
-            STATUS.event(f"[nav] maze explored ({len(self.map.visited)} cells) -- "
-                         "heading home")
+            STATUS.event(f"[nav] no frontier left: {len(self.map.visited)} cells visited, "
+                         f"{len(self.map.blocked)} blocked -- calling the maze explored "
+                         "and heading home")
             self._enter(RETURN)
             return None
         self.route = self.map.path(self.cell, frontier, True, self.facing,
@@ -1726,7 +1739,13 @@ class Nav:
         a victim chase left it in a cell it never mapped."""
         if self.cell == self.base_cell:
             self.route = None
-            self._enter(AT_BASE if self.carrying else DONE)
+            if self.carrying:
+                self._enter(AT_BASE)
+            else:
+                self._finish("back at base with no victim aboard -- nothing left to "
+                             "collect (maze counted as explored: no frontier cells)"
+                             if not self.map.frontier_cells() else
+                             "back at base with no victim aboard")
             return None
         goal = [self.base_cell]
         for optimistic in (False, True):
@@ -1743,8 +1762,8 @@ class Nav:
             STATUS.event("[nav] no route home -- clearing blocked cells and retrying")
             self.map.blocked.clear()
             return self._plan_home()
-        STATUS.event("[nav] no route to base on the map -- stopping")
-        self._enter(DONE)
+        self._finish(f"no route from {self.cell} to base {self.base_cell} on the map, "
+                     "even assuming unseen walls are open and clearing blocked cells")
         return None
 
     def _approach(self, lost):
@@ -1894,7 +1913,7 @@ class Nav:
         self.rescued += 1
         STATUS.event(f"[nav] VICTIM RESCUED -- {self.rescued} home")
         if self.rescued >= VICTIMS_TOTAL:
-            self._enter(DONE)
+            self._finish(f"all {VICTIMS_TOTAL} victims rescued")
         else:
             self._enter(SEARCH)
 
