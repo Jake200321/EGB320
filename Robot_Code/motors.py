@@ -82,8 +82,8 @@ SWAP_MOTORS = False
 # the heading is locked -- where nothing is correcting. While exploring, the
 # encoder straight-line correction already compensates for a track imbalance, so
 # a trim there just reduces how hard it has to work.
-LEFT_TRIM = 1.3
-RIGHT_TRIM = 1.0
+LEFT_TRIM = 1.0
+RIGHT_TRIM = 0.77
 # -------------------------------------------------------------------------------
 
 SPEED_LIMIT = 127                   # the board's hard limit
