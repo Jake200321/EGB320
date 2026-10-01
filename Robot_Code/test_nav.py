@@ -1105,6 +1105,22 @@ check("yaw response: one row per difference, zero difference turns nothing",
 check("...and a bigger difference turns left more (right track faster)",
       _rows5[-1][3] > _rows5[1][3] > -1.0)
 
+print("25b) trims are for driving, not pivots")
+_saved = (MOT.LEFT_TRIM, MOT.RIGHT_TRIM, MOT.SWAP_MOTORS, MOT.LEFT_SIGN, MOT.RIGHT_SIGN)
+MOT.LEFT_TRIM, MOT.RIGHT_TRIM, MOT.SWAP_MOTORS, MOT.LEFT_SIGN, MOT.RIGHT_SIGN = 1.0, 0.8, False, 1, 1
+_fbp = _FakeBoard(); _dp = MOT.MotorDriver(controller=_fbp)
+_dp.set_raw(100, 100)
+check("driving straight: the right track is trimmed down", _fbp.sent == (100, 80))
+_dp.set_raw(-100, 100)
+check("pivoting: both tracks get the same power (no trim)", _fbp.sent == (-100, 100))
+_dp.set_raw(100, -100)
+check("...either way round", _fbp.sent == (100, -100))
+_dp.set_velocity(0.0, 2.2)
+check("a spin through set_velocity is not trimmed either", abs(_fbp.sent[0]) == abs(_fbp.sent[1]))
+_dp.set_raw(0, 100)
+check("swinging on one track (the other stopped) still trims", _fbp.sent == (0, 80))
+MOT.LEFT_TRIM, MOT.RIGHT_TRIM, MOT.SWAP_MOTORS, MOT.LEFT_SIGN, MOT.RIGHT_SIGN = _saved
+
 print("26) --no-centring drives on the encoder heading alone")
 n = M.Nav(LogDrive(), FakeVision([None]), FakeLeds(), _Sides(0.14, 0.02))   # wall hard on the right
 n.odo.theta = M.HEADING_RAD[0]

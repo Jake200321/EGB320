@@ -255,9 +255,18 @@ class MotorDriver:
 
         Trim goes first, while left/right still refer to physical tracks -- after the
         swap they're board channels, and trimming there would land on the wrong one.
+
+        Trim is only for driving, where both tracks go the same way and it evens out a
+        pull. In a pivot (tracks counter-rotating) it's skipped: the chassis couples the
+        tracks, so the stronger motor wins, and trimming one side down just hands it the
+        win -- the spin then comes from ONE track, a swing about the other, and the turn
+        comes out about half what the encoders say (seen: a "360 deg" spin was 175).
         """
-        left = int(round(left * LEFT_TRIM))
-        right = int(round(right * RIGHT_TRIM))
+        if left * right >= 0:
+            left = int(round(left * LEFT_TRIM))
+            right = int(round(right * RIGHT_TRIM))
+        else:
+            left, right = int(round(left)), int(round(right))
         left, right = left * LEFT_SIGN, right * RIGHT_SIGN
         if SWAP_MOTORS:
             left, right = right, left
