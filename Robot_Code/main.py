@@ -183,10 +183,16 @@ BLOCK_CONFIRM = 3
 HEADING_HOLD_GAIN = 3.0     # rad/s per rad of heading error
 MAX_STEER_RATE = 0.8        # rad/s cap while driving
 # Corridor centring: aim this many rad of heading back towards the middle per metre
-# off centre, capped at MAX_CENTRE_ANGLE. 4.0 means 1 cm off -> 2.3 deg correction.
+# off centre, capped at MAX_CENTRE_ANGLE. 7.0 means 1 cm off -> 4 deg correction.
+# The offset decays at about SEARCH_SPEED * CENTRE_GAIN per second (0.9/s here), so
+# 4.0 took ~2 s -- most of a cell -- to pull in.
 # TUNE: weaves -> lower CENTRE_GAIN; drifts into walls -> raise it.
-CENTRE_GAIN = 4.0
-MAX_CENTRE_ANGLE = 0.25     # rad, ~14 deg
+CENTRE_GAIN = 7.0
+MAX_CENTRE_ANGLE = 0.30     # rad, ~17 deg
+# Offset from the side sonars directly, not via the filter: a filter that has settled
+# believes itself and answers a new reading slowly. A reading older than this is
+# ignored (the filter's estimate is used instead).
+SIDE_FRESH_S = 0.35
 
 # --- localisation: odometry corrected by the sonars against the map ------------
 # Each sonar reading is compared with the range the map predicts from where the
@@ -882,13 +888,43 @@ class Mover:
 
         # Off the centreline to the right -> aim a little left of the corridor, and
         # vice versa. The pose already carries what the side walls say.
-        self.lateral = (o.x - tx) * rx + (o.y - ty) * ry
+        self.lateral = self._side_offset()
+        if self.lateral is None:
+            self.lateral = (o.x - tx) * rx + (o.y - ty) * ry
         aim = self.heading + _clamp(CENTRE_GAIN * self.lateral, MAX_CENTRE_ANGLE)
         w = _clamp(HEADING_HOLD_GAIN * wrap(aim - o.theta), MAX_STEER_RATE)
         v = SEARCH_SPEED if remaining > ARRIVE_SLOW_M or self.through else ARRIVE_SPEED
         if remaining < 0:
             v = -ARRIVE_SPEED                    # target is behind: back straight up
         self.drive.set_velocity(v, w)
+        return None
+
+    def _side_offset(self):
+        """Metres right of the corridor centre read straight off the side sonars, or
+        None if there's nothing usable (then the filter's pose is used).
+
+        Both walls close: half the difference. Only one: its distance against where a
+        wall reads from the centre. A reading too far to be this corridor's wall is
+        an opening, and is ignored. Valid only while pointing along the corridor,
+        which is when this is called.
+        """
+        get = getattr(self.sonar, "get", None)
+        stamp = getattr(self.sonar, "stamp", None)
+        if get is None or stamp is None:
+            return None
+        now = time.monotonic()
+        near = SIDE_WALL_AT_CENTRE_M + WALL_PRESENT_WINDOW_M
+        reads = {}
+        for name in ("left", "right"):
+            t, d = stamp(name), get(name)
+            if t is not None and d is not None and now - t <= SIDE_FRESH_S and d < near:
+                reads[name] = d
+        if "left" in reads and "right" in reads:
+            return (reads["left"] - reads["right"]) / 2.0
+        if "right" in reads:
+            return SIDE_WALL_AT_CENTRE_M - reads["right"]
+        if "left" in reads:
+            return reads["left"] - SIDE_WALL_AT_CENTRE_M
         return None
 
     def _arrive(self):
