@@ -14,7 +14,9 @@ the walls, and holds heading from the encoders so neither track falls behind.
 
     python3 main.py                      # full run: camera window + map window
     python3 main.py --no-camera          # explore and map only, no vision at all
-    python3 main.py --no-camera-walls    # camera for victims only; walls from sonars alone
+    python3 main.py --camera-walls       # ALSO use the camera to see walls (off by default)
+    python3 main.py --no-centring        # encoder heading hold only, no sonar centring
+    python3 straight_test.py             # does it drive straight? motors + encoders only
     python3 main.py --base-cell 6,6 --start-heading W   # base in another corner
     python3 main.py --calibrate straight # measure TICKS_PER_M
     python3 main.py --calibrate turn     # measure EFFECTIVE_TRACK_M
@@ -211,7 +213,13 @@ SIDE_FRESH_S = 0.35
 #     one alone is used when the other has nothing;
 #   * mapping: a wall seen by EITHER marks the edge (a missed wall costs a collision,
 #     a phantom one only a detour), except towards a cell a victim is in.
-USE_CAMERA_WALLS = True
+# OFF until it's been checked against the real maze: on the robot it contradicted the
+# sonar (phantom "wall ahead") and its yaw reading led the squaring-up astray. Turn it on
+# with --camera-walls to try it; straight_test.py first if driving isn't straight.
+USE_CAMERA_WALLS = False
+# Steer back to the corridor centre from the side sonars. --no-centring turns it off,
+# leaving encoder heading hold alone, to find out whether a veer is the motors or this.
+CENTRING = True
 CAMERA_WALL_WEIGHT = 0.7    # camera's share of the centring offset when both agree
                             # (it updates ~20x a second, the sonars ~7x)
 CAMERA_AGREE_M = 0.03       # ...agree = within this; further apart, trust the sonars
@@ -1074,7 +1082,7 @@ class Mover:
 
         # Off the centreline to the right -> aim a little left of the corridor, and
         # vice versa. The pose already carries what the side walls say.
-        self.lateral = self._blended_offset()
+        self.lateral = self._blended_offset() if CENTRING else 0.0
         if self.lateral is None:
             self.lateral = (o.x - tx) * rx + (o.y - ty) * ry
         aim = self.heading + _clamp(CENTRE_GAIN * self.lateral, MAX_CENTRE_ANGLE)
@@ -2290,6 +2298,7 @@ class Nav:
 
 
 def main():
+    global CENTRING
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__)
@@ -2312,8 +2321,12 @@ def main():
     ap.add_argument("--no-camera", action="store_true",
                     help="no vision at all -- explore and map the maze only")
     ap.add_argument("--no-map", action="store_true", help="don't open the map window")
+    ap.add_argument("--camera-walls", action="store_true",
+                    help="also use the camera to see walls (off by default)")
     ap.add_argument("--no-camera-walls", action="store_true",
-                    help="don't use the camera to see walls -- sonars only")
+                    help="(the default) walls from the sonars alone")
+    ap.add_argument("--no-centring", action="store_true",
+                    help="don't steer back to the corridor centre -- encoder heading hold only")
     ap.add_argument("--base-cell", default=None,
                     help=f"base cell as col,row (default {BASE_CELL[0]},{BASE_CELL[1]})")
     ap.add_argument("--start-heading", choices=["N", "E", "S", "W"], default=None,
@@ -2354,6 +2367,9 @@ def main():
         except (ValueError, AssertionError):
             raise SystemExit("--base-cell wants col,row -- e.g. 0,6")
 
+    if args.no_centring:
+        CENTRING = False
+        STATUS.event("[nav] --no-centring: encoder heading hold only")
     STATUS.enabled = not args.no_status
     leds = Leds()
     drive = Drive(enabled=not args.no_motors)
@@ -2372,8 +2388,8 @@ def main():
         vision = VictimVision(use_placeholder=args.placeholder_vision)
         vision.blur_threshold = blur
     wallcam = None
-    if (USE_CAMERA_WALLS and not args.no_camera and not args.no_camera_walls
-            and not args.placeholder_vision):
+    if ((USE_CAMERA_WALLS or args.camera_walls) and not args.no_camera
+            and not args.no_camera_walls and not args.placeholder_vision):
         wallcam = make_wall_camera()
     nav = Nav(drive, vision, leds, sonar, base_cell=base_cell,
               start_heading=args.start_heading, wall_camera=wallcam)

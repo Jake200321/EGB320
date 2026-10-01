@@ -978,5 +978,95 @@ M.STATUS.event = _orig_ev
 n, d = mover_nav(yaw=0.30)                       # 17 deg: past what the camera can measure
 check("a wall angle bigger than CAMERA_YAW_MAX_RAD is not trusted", n.mover._wall_yaw() == (None, None))
 
+print("25) straight_test.py: steering check and trim advice")
+import straight_test as ST
+
+
+class _Clock:
+    def __init__(self): self.t = 0.0
+    def monotonic(self): return self.t
+    def sleep(self, s): self.t += s; self.on_sleep(s)
+    def on_sleep(self, s): pass
+
+
+class _Tracks:
+    """Fake chassis: ticks accumulate from the commanded track speeds. `gain_l/gain_r`
+    are how strong each track really is; `mirrored` swaps which encoder counts which."""
+    def __init__(self, clock, gain_l=1.0, gain_r=1.0, mirrored=False):
+        self.l = self.r = 0.0; self.v = self.w = 0.0
+        self.gl, self.gr, self.mirrored = gain_l, gain_r, mirrored
+        clock.on_sleep = self.advance
+    def set_velocity(self, v, w): self.v, self.w = v, w
+    def stop(self): self.v = self.w = 0.0
+    def read_encoders(self):
+        a, b = (self.r, self.l) if self.mirrored else (self.l, self.r)
+        return (int(a), int(b))
+    def advance(self, dt):
+        half = 0.0615
+        self.l += (self.v - self.w * half) * self.gl * dt * M.TICKS_PER_M
+        self.r += (self.v + self.w * half) * self.gr * dt * M.TICKS_PER_M
+
+
+def _run_steer(**kw):
+    clock = _Clock()
+    drive = _Tracks(clock, **kw)
+    odo = M.Odometry(M.TICKS_PER_M, M.EFFECTIVE_TRACK_M)
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        real = ST.drive_run
+        ST.drive_run = lambda d, o, sec, v, st, label, clock=clock: real(d, o, sec, v, st, label, clock)
+        try:
+            ok = ST.step1_steering(drive, odo, 2.5, M.TICKS_PER_M)
+        finally:
+            ST.drive_run = real
+    return ok, buf.getvalue()
+
+
+ok, out = _run_steer()
+check("steering and encoders agree -> OK", ok and "OK" in out)
+ok, out = _run_steer(mirrored=True)
+check("encoder channels mirrored vs the tracks -> says so and names SWAP_MOTORS",
+      not ok and "MIRRORED" in out and "SWAP_MOTORS" in out)
+
+_old_trims = (ST.MOT.LEFT_TRIM, ST.MOT.RIGHT_TRIM)
+ST.MOT.LEFT_TRIM = ST.MOT.RIGHT_TRIM = 1.0
+ratio, adv = ST.trim_advice(1000, 1000)
+check("even tracks -> trims are fine", "fine" in adv)
+ratio, adv = ST.trim_advice(1000, 1250)
+check("right track 25% further -> pulls LEFT, lower RIGHT_TRIM to 0.8",
+      "pulls LEFT" in adv and "RIGHT_TRIM = 0.800" in adv)
+ratio, adv = ST.trim_advice(1250, 1000)
+check("left track 25% further -> pulls RIGHT, lower LEFT_TRIM to 0.8",
+      "pulls RIGHT" in adv and "LEFT_TRIM = 0.800" in adv)
+ST.MOT.LEFT_TRIM, ST.MOT.RIGHT_TRIM = _old_trims
+
+clock = _Clock(); drive = _Tracks(clock, gain_l=1.0, gain_r=1.15)
+odo = M.Odometry(M.TICKS_PER_M, M.EFFECTIVE_TRACK_M)
+r = ST.drive_run(drive, odo, 2.5, 0.13, lambda o: 0.0, "open", clock)
+check("a stronger right track -> heading drifts LEFT (+) in the open-loop run", r["heading"] > 3)
+odo = M.Odometry(M.TICKS_PER_M, M.EFFECTIVE_TRACK_M)
+clock = _Clock(); drive = _Tracks(clock, gain_l=1.0, gain_r=1.15)
+r2 = ST.drive_run(drive, odo, 2.5, 0.13,
+                  lambda o: max(-1.0, min(1.0, 4.0 * M.wrap(0.0 - o.theta))), "hold", clock)
+check("...and the heading hold pulls it back to within a few degrees",
+      abs(r2["heading"]) < 3 and r2["peak"] < abs(r["heading"]))
+
+print("26) --no-centring drives on the encoder heading alone")
+n = M.Nav(LogDrive(), FakeVision([None]), FakeLeds(), _Sides(0.14, 0.02))   # wall hard on the right
+n.odo.theta = M.HEADING_RAD[0]
+n.mover.move_to(*n.map.centre((0, 5)), M.HEADING_RAD[0])
+n.mover.update()
+check("with centring on, a wall close on the right steers it away (lateral set)",
+      n.mover.lateral is not None and abs(n.mover.lateral) > 0.01)
+M.CENTRING = False
+n = M.Nav(LogDrive(), FakeVision([None]), FakeLeds(), _Sides(0.14, 0.02))
+n.odo.theta = M.HEADING_RAD[0]
+n.mover.move_to(*n.map.centre((0, 5)), M.HEADING_RAD[0])
+n.mover.update()
+check("with --no-centring it ignores the walls and holds heading", n.mover.lateral == 0.0)
+M.CENTRING = True
+check("camera walls are OFF by default", M.USE_CAMERA_WALLS is False)
+
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)
