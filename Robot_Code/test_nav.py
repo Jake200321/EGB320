@@ -802,5 +802,58 @@ n.odo.theta = EAST + 0.01
 n.mover.update()
 check("no camera -> no squaring-up phase, straight to driving", n.mover.phase == M.Mover.DRIVE)
 
+print("21) the wall ahead: the camera where it can range, the sonar where it can't")
+_half_to_sonar = M.CELL_M / 2 - M.FRONT_WALL_AT_CENTRE_M     # sonar sits this far ahead of the centre
+
+
+class _Front(_Open):
+    """Sonars with a front reading only."""
+    def __init__(self, front):
+        super().__init__(); self.front = front
+    def stamp(self, name): return time.monotonic()
+
+
+def front_nav(sonar_front, **view_kw):
+    n = M.Nav(LogDrive(), FakeVision([None]), FakeLeds(), _Front(sonar_front), wall_camera=object())
+    n.cam_walls = view(**view_kw)
+    return n
+
+
+d, src = front_nav(0.20, front_m=0.62).front_distance()
+check("camera can range the wall -> camera's distance", src == "cam"
+      and abs(d - (0.62 - M.CAMERA_FORWARD_M)) < 1e-9)
+d, src = front_nav(0.05, front_close=True).front_distance()
+check("camera says 'too close to see' -> the sonar gives the distance", src == "sonar"
+      and abs(d - (0.05 + _half_to_sonar)) < 1e-9)
+d, src = front_nav(0.30, front_m=None).front_distance()
+check("camera sees no wall ahead -> the sonar", src == "sonar")
+d, src = front_nav(None, front_close=True).front_distance()
+check("close to the camera and no echo -> says it can't tell", d is None and src is None)
+d, src = front_nav(None, front_m=0.50).front_distance()
+check("sonar silent but the camera ranges it -> camera", src == "cam")
+
+n = front_nav(0.07, front_close=True)
+r, _t = n.mover._front_reading()
+check("blocked-ahead check: sonar reading used as is when it has an echo", r == 0.07)
+n = front_nav(None, front_m=0.62)
+r, _t = n.mover._front_reading()
+check("...camera, expressed as an equivalent sonar reading, when the sonar is silent",
+      abs(r - (0.62 - M.CAMERA_FORWARD_M - _half_to_sonar)) < 1e-9)
+n = front_nav(None, front_close=True)
+check("...nothing when neither can say", n.mover._front_reading() == (None, None))
+
+# the camera alone spots something in the way when the sonar gets no echo
+n = M.Nav(LogDrive(), FakeVision([None]), FakeLeds(), _Front(None), wall_camera=object())
+n.odo.theta = M.HEADING_RAD[0]
+n.mover.move_to(*n.map.centre((0, 5)), M.HEADING_RAD[0])      # one cell north, open on the map
+for i in range(M.BLOCK_CONFIRM + 2):
+    # a wall only 30 cm from the lens, with ~28 cm to go: the cell ahead is walled off
+    n.cam_walls = view(t=time.monotonic() + i * 1e-3, front_m=0.30)
+    n.mover.update()
+    if n.mover.phase == M.Mover.BACKOUT:
+        break
+check("silent sonar, camera sees a wall too near -> backs out",
+      n.mover.phase == M.Mover.BACKOUT)
+
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)

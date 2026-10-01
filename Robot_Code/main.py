@@ -400,6 +400,9 @@ def status_text(nav, sonar, leds, hz):
             front = "CLS" if view.front_close else cv(view.front_m)
             yaw = "" if view.yaw_rad is None else f" Y{math.degrees(view.yaw_rad):+.0f}"
             sonar_txt += f" cam L{cv(view.left_m)} F{front} R{cv(view.right_m)}{yaw}"
+        ahead, src = nav.front_distance()
+        sonar_txt += (" ahead ---" if ahead is None
+                      else f" ahead {ahead*100:.0f}cm({src})")
 
     lit = "".join(c if getattr(leds, "_state", {}).get(n) else "-"
                   for n, c in (("green", "G"), ("yellow", "Y"), ("red", "R")))
@@ -963,8 +966,7 @@ class Mover:
 
         if self.grid and self.forward:
             # Something much closer than the far side of the cell ahead is in the way.
-            front = self.sonar.front
-            stamp = self.sonar.stamp("front") if hasattr(self.sonar, "stamp") else None
+            front, stamp = self._front_reading()
             fresh = stamp is not None and stamp != self._front_stamp
             self._front_stamp = stamp
             if front is not None and front - FRONT_WALL_AT_CENTRE_M < remaining - BLOCK_MARGIN_M:
@@ -1007,6 +1009,25 @@ class Mover:
             v = -ARRIVE_SPEED                    # target is behind: back straight up
         self.drive.set_velocity(v, w)
         return None
+
+    def _front_reading(self):
+        """The wall ahead as (a front-sonar-equivalent reading, when it was taken).
+
+        The sonar is the one that knows how far the wall is up close -- exactly where
+        the camera is blind (its view of a wall's foot starts ~27 cm out) -- so it's
+        used whenever it has an echo. With no echo (a soft or glancing wall) the camera
+        steps in, if the wall is far enough for it to range. Both are expressed as what
+        the front sonar would read, so the callers' thresholds don't care which it was.
+        """
+        front = self.sonar.front
+        if front is not None:
+            stamp = self.sonar.stamp("front") if hasattr(self.sonar, "stamp") else None
+            return front, stamp
+        view = self.camera_view() if self.camera_view else None
+        if view is not None and not view.front_close and view.front_m is not None:
+            from_centre = view.front_m - CAMERA_FORWARD_M
+            return max(0.0, from_centre - (CELL_M / 2.0 - FRONT_WALL_AT_CENTRE_M)), view.t
+        return None, None
 
     def _camera_offset(self):
         """Metres right of centre from the camera's wall view, or None. Walls sit on
@@ -1628,6 +1649,21 @@ class Nav:
         if view is None or view.age() > CAMERA_FRESH_S:
             return None
         return view
+
+    def front_distance(self):
+        """(metres from the turning centre to the wall ahead, "cam" | "sonar"), or
+        (None, None) if neither can tell.
+
+        The camera ranges a wall further out than ~27 cm from the lens; any closer it
+        only knows "close" -- and that's when the front sonar is the one to ask.
+        """
+        view = self._camera_view()
+        if view is not None and not view.front_close and view.front_m is not None:
+            return max(0.0, view.front_m - CAMERA_FORWARD_M), "cam"
+        front = self.sonar.front
+        if front is not None:
+            return front + (CELL_M / 2.0 - FRONT_WALL_AT_CENTRE_M), "sonar"
+        return None, None
 
     def _camera_sees_wall(self, name):
         """Does the camera see a wall on this side of the cell? None if it can't say.
