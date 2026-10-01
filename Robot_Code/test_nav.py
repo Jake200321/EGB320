@@ -855,5 +855,36 @@ for i in range(M.BLOCK_CONFIRM + 2):
 check("silent sonar, camera sees a wall too near -> backs out",
       n.mover.phase == M.Mover.BACKOUT)
 
+print("22) it says so when the encoders aren't keeping up with the drive command")
+_events = []
+_orig_event = M.STATUS.event
+M.STATUS.event = lambda msg: _events.append(msg)
+
+
+def stalled_drive(left_m=0.0, right_m=0.0, gone=0.0, secs=2.5):
+    n, d = mover_nav()
+    n.odo.theta = M.HEADING_RAD[0]
+    n.mover.move_to(*n.map.centre((0, 5)), M.HEADING_RAD[0])
+    n.mover.phase_started = time.monotonic() - secs
+    n.odo.y += gone
+    n.odo.left_m, n.odo.right_m = left_m, right_m
+    n.mover._start_lr = (0.0, 0.0)
+    n.mover.update()
+    return n
+
+
+_events.clear(); stalled_drive()
+check("encoders counting nothing -> says so", any("NOTHING" in e for e in _events))
+_events.clear(); stalled_drive(left_m=0.03, right_m=0.03, gone=0.03)
+check("encoders counting far too little -> suggests TICKS_PER_M",
+      any("TICKS_PER_M" in e and "calibrate" in e for e in _events))
+_events.clear(); stalled_drive(left_m=0.2, right_m=0.2, gone=0.2)
+check("keeping up fine -> silent", not any("[odo]" in e for e in _events))
+_events.clear(); stalled_drive(secs=0.5)
+check("too early to judge -> silent", not any("[odo]" in e for e in _events))
+_events.clear(); n = stalled_drive(); n.mover.update()
+check("warns once per drive, not every tick", sum("[odo]" in e for e in _events) == 1)
+M.STATUS.event = _orig_event
+
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)

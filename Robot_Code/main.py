@@ -174,6 +174,12 @@ ARRIVE_SPEED = 0.08         # ...to this, so it stops where it means to
 ARRIVE_TOLERANCE_M = 0.01
 REVERSE_SPEED = 0.10        # backing out of a cell that turned out to be blocked
 DRIVE_TIMEOUT_S = 6.0       # no arrival in this long (stuck on a bump) = blocked
+# Odometry sanity check: still driving after this long, the encoders should have
+# counted at least this share of the distance the commanded speed implies. Falling
+# short means the encoders aren't counting or TICKS_PER_M is wrong -- and then every
+# cell "never arrives", which looks like blocked cells and an empty map.
+ODO_CHECK_S = 2.0
+ODO_MIN_SHARE = 0.4
 # Something this much closer than the far side of the cell ahead is in the way (a
 # victim, rubble, a wall the side sonar missed). Seen on this many fresh pings.
 BLOCK_MARGIN_M = 0.05
@@ -864,6 +870,8 @@ class Mover:
         self.phase = self.DRIVE
         self.phase_started = now
         self.start = (self.odo.x, self.odo.y)
+        self._start_lr = (self.odo.left_m, self.odo.right_m)
+        self._odo_warned = False
         # Which way the target lies at the start. A forward move that overshoots has
         # arrived; only a move that STARTED behind the target reverses to it.
         ux, uy = math.cos(self.heading), math.sin(self.heading)
@@ -1007,6 +1015,7 @@ class Mover:
         v = SEARCH_SPEED if remaining > ARRIVE_SLOW_M or self.through else ARRIVE_SPEED
         if remaining < 0:
             v = -ARRIVE_SPEED                    # target is behind: back straight up
+        self._check_odometry(now, ux, uy)
         self.drive.set_velocity(v, w)
         return None
 
@@ -1084,6 +1093,29 @@ class Mover:
         if "left" in reads:
             return reads["left"] - SIDE_WALL_AT_CENTRE_M
         return None
+
+    def _check_odometry(self, now, ux, uy):
+        """Say so, once, if the encoders aren't keeping up with the drive command."""
+        elapsed = now - self.phase_started
+        if self._odo_warned or elapsed < ODO_CHECK_S or not self.forward:
+            return
+        o = self.odo
+        gone = (o.x - self.start[0]) * ux + (o.y - self.start[1]) * uy
+        expected = SEARCH_SPEED * (elapsed - 0.3)        # allow for the spin-up
+        if gone >= ODO_MIN_SHARE * expected:
+            return
+        self._odo_warned = True
+        counted = abs(o.left_m - self._start_lr[0]) + abs(o.right_m - self._start_lr[1])
+        if counted < 0.005:
+            STATUS.event(f"[odo] WARNING: {elapsed:.1f}s of driving and the encoders counted "
+                         "NOTHING -- check the encoder wiring / board, or run with "
+                         "--calibrate straight")
+        else:
+            rough = TICKS_PER_M * max(gone, 1e-3) / expected
+            STATUS.event(f"[odo] WARNING: {elapsed:.1f}s at {SEARCH_SPEED*100:.0f}cm/s should "
+                         f"be ~{expected*100:.0f}cm but the encoders say {gone*100:.0f}cm -- "
+                         f"TICKS_PER_M ({TICKS_PER_M:.0f}) is probably too big, roughly "
+                         f"{rough:.0f}. Measure it: python3 main.py --calibrate straight")
 
     def _arrive(self):
         if not self.through:
