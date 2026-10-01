@@ -1141,6 +1141,35 @@ check("odometry says left but the robot visibly went RIGHT -> MIRRORED, names SW
 ok, out = _step6("")
 check("no answer -> doesn't pretend to judge", ok is None)
 
+print("25d) the shipped motor wiring: named tracks land on the right physical motors")
+# Measured: board channel 1 drives the physical RIGHT motor, channel 2 the physical LEFT,
+# and driving forward needs +ch1 / -ch2. Whatever the SWAP/SIGN/TRIM values are, this must
+# hold for the config that ships, or a "turn left" turns the robot right.
+_fbw = _FakeBoard()
+_dw = MOT.MotorDriver(controller=_fbw)
+_t = (MOT.LEFT_TRIM, MOT.RIGHT_TRIM)
+MOT.LEFT_TRIM = MOT.RIGHT_TRIM = 1.0
+_dw.set_raw(100, 100)
+check("both tracks forward = (+ch1, -ch2) -- what actually drives the robot straight",
+      _fbw.sent[0] > 0 > _fbw.sent[1] and abs(_fbw.sent[0]) == abs(_fbw.sent[1]))
+_dw.set_raw(-100, 100)                                 # LEFT pivot: left back, right forward
+check("a LEFT pivot drives the physical RIGHT motor (ch1) forward and the LEFT (ch2) back",
+      _fbw.sent[0] > 0 and _fbw.sent[1] > 0)
+_dw.set_raw(100, -100)                                 # RIGHT pivot
+check("a RIGHT pivot is the reverse", _fbw.sent[0] < 0 and _fbw.sent[1] < 0)
+_dw.set_raw(100, 0)                                    # only the named LEFT track
+check("the named LEFT track alone is the physical left motor (ch2)",
+      _fbw.sent[0] == 0 and _fbw.sent[1] != 0)
+_dw.set_raw(0, 100)
+check("the named RIGHT track alone is the physical right motor (ch1)",
+      _fbw.sent[1] == 0 and _fbw.sent[0] != 0)
+MOT.LEFT_TRIM, MOT.RIGHT_TRIM = _t
+_fbw2 = _FakeBoard(); _dw2 = MOT.MotorDriver(controller=_fbw2)
+_fbw2.raw = (100, 100); _dw2.read_encoders(); _fbw2.raw = (300, 280)
+_tk = _dw2.read_encoders()
+check("the encoders follow the motors: ch1 (physical right) counts into the RIGHT track",
+      _tk is not None and _tk[1] > _tk[0] > 0)
+
 print("26) --no-centring drives on the encoder heading alone")
 n = M.Nav(LogDrive(), FakeVision([None]), FakeLeds(), _Sides(0.14, 0.02))   # wall hard on the right
 n.odo.theta = M.HEADING_RAD[0]

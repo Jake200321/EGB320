@@ -57,8 +57,16 @@ MAX_WHEEL_RPM = 130.0
 #   robot spins instead of driving straight -> the two disagree; flip one
 #
 # Find out with:  python3 motor_spin_test.py
-LEFT_SIGN = 1
-RIGHT_SIGN = -1
+#
+# These are applied to the track you NAME (left/right) BEFORE SWAP_MOTORS puts it on a
+# board channel -- so when SWAP_MOTORS is on they describe the motor that ends up driving
+# that track, not the board channel. Turning SWAP_MOTORS on or off means flipping both.
+#
+# Measured 2026-10-01 with motor_spin_test.py: board channel 1 drives the physical RIGHT
+# motor and channel 2 the physical LEFT, and the driving direction needs +ch1 / -ch2. With
+# SWAP_MOTORS on, that's LEFT_SIGN = -1 (-> ch2) and RIGHT_SIGN = +1 (-> ch1).
+LEFT_SIGN = -1
+RIGHT_SIGN = 1
 
 # ---- ENCODER DIRECTION -- separate from the motors' ---------------------------
 # Which way each encoder counts when its track drives FORWARD: +1 if the board's count
@@ -87,7 +95,11 @@ ENCODER_RIGHT_SIGN = 1
 # A swap leaves straight driving looking perfect, because both channels get the same
 # command -- it only shows up the moment the robot tries to turn. It also inverts the
 # encoder straight-line correction, which then steers further off instead of back.
-SWAP_MOTORS = False
+# MEASURED: the two board channels are wired to the opposite tracks (motor_spin_test.py:
+# "left" spun the right motor and vice versa), so this is True. With it False a "turn
+# left" command physically turned the robot RIGHT while the odometry said left -- straight
+# driving looked perfect, every turn and every heading correction was mirrored.
+SWAP_MOTORS = True
 
 # ---- TRACK TRIM -- fix a robot that pulls to one side -------------------------
 # Per-track multipliers on every command. Raise one, or lower the other, until it
@@ -105,8 +117,10 @@ SWAP_MOTORS = False
 # the heading is locked -- where nothing is correcting. While exploring, the
 # encoder straight-line correction already compensates for a track imbalance, so
 # a trim there just reduces how hard it has to work.
-LEFT_TRIM = 1.0
-RIGHT_TRIM = 0.9
+# (These were tuned while the channels were swapped, so the 0.9 that was on "right" was
+# really on the physical LEFT track; it's carried over to LEFT now that the names are right.)
+LEFT_TRIM = 0.9
+RIGHT_TRIM = 1.0
 # -------------------------------------------------------------------------------
 
 SPEED_LIMIT = 127                   # the board's hard limit
