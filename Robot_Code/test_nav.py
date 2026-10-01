@@ -1088,6 +1088,16 @@ with contextlib.redirect_stdout(_buf):
         ST.drive_run = _real
 check("step 1 reports steering authority as a percentage", "steering authority" in _buf.getvalue())
 
+_clock = _Clock(); _board = _Board(_clock); _clock.on_sleep = _board.advance
+_buf = io.StringIO()
+with contextlib.redirect_stdout(_buf):
+    _rows5 = ST.step5_yaw_response(_board, M.Odometry(M.TICKS_PER_M, M.EFFECTIVE_TRACK_M),
+                                   M.TICKS_PER_M, M.EFFECTIVE_TRACK_M, _clock)
+check("yaw response: one row per difference, zero difference turns nothing",
+      len(_rows5) == len(ST.YAW_RESPONSE_DIFFS) and abs(_rows5[0][3]) < 1.0)
+check("...and a bigger difference turns left more (right track faster)",
+      _rows5[-1][3] > _rows5[1][3] > -1.0)
+
 print("26) --no-centring drives on the encoder heading alone")
 n = M.Nav(LogDrive(), FakeVision([None]), FakeLeds(), _Sides(0.14, 0.02))   # wall hard on the right
 n.odo.theta = M.HEADING_RAD[0]

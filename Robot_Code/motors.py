@@ -38,6 +38,13 @@ SPROCKET_CIRCUM_M = math.pi * 0.024
 # against, so setting it too HIGH makes the robot crawl: it thinks 0.10 m/s is a small
 # fraction of what it can do and sends a correspondingly small raw speed. 200 was the
 # 6 V no-load figure; under load on tracks it's nowhere near that. MEASURE.
+#
+# NOTE (measured 2026-10-01, straight_test.py --only 4, driving straight): real speed is
+# a straight line in raw above ~65 -- 0.078 m/s at 65, 0.205 at 100, 0.315 at 127 -- so
+# the scale this implies is ~251 rpm, and at 130 every "0.13 m/s" is really ~0.26 m/s.
+# Left at 130 DELIBERATELY: the pivot turns (and their ">=100/127" floors in test_nav.py)
+# were tuned on this scale, and a pivot needs far more raw than straight driving to scrub
+# the tracks round. Changing it means re-tuning every turn and speed constant together.
 MAX_WHEEL_RPM = 130.0
 
 # ---- MOTOR DIRECTION -- change these if a track drives the wrong way ----------

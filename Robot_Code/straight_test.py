@@ -2,7 +2,7 @@
 
     python3 straight_test.py                # all three steps, ~2.5 s of driving each
     python3 straight_test.py --seconds 3    # longer runs
-    python3 straight_test.py --only 4       # just one step (1-4)
+    python3 straight_test.py --only 5       # just one step (1-5)
 
 Give it a metre or more of clear floor ahead. It asks before every run.
 
@@ -19,6 +19,9 @@ Give it a metre or more of clear floor ahead. It asks before every run.
      with the speed the encoders actually measured. This is what the controller's idea of
      "0.13 m/s" or "turn at 0.8 rad/s" has to match; when it doesn't, every correction the
      nav asks for comes out too weak or too strong.
+  5. YAW RESPONSE -- how much the robot actually turns for a given difference between
+     the tracks, driving, forward then back so it stays put. Finds the dead band and
+     the gain the heading corrections really have.
 
 Nothing here edits a file: it prints the lines to change.
 """
@@ -179,6 +182,47 @@ def step4_speed_curve(drive, ticks_per_m, clock=time, raws=SPEED_CURVE_RAWS):
     return rows
 
 
+YAW_RESPONSE_DIFFS = (0, 10, 20, 30, 40, 50, 70)
+YAW_RESPONSE_MEAN = 80
+
+
+def step5_yaw_response(drive, odo, ticks_per_m, track_m, clock=time, diffs=YAW_RESPONSE_DIFFS,
+                       mean=YAW_RESPONSE_MEAN):
+    """Turn rate achieved for each raw difference between the tracks, both tracks driving.
+
+    The right track is the faster one (so these turn LEFT), alternately forward and in
+    reverse so the robot ends where it started. Yaw rate comes from the encoder
+    difference over `track_m`.
+    """
+    print("\n5) YAW RESPONSE -- both tracks driving, right faster than left by a raw difference")
+    print("   (mean raw %d; each ~1 s, alternating forward / back so it stays put)" % mean)
+    print("   raw diff   left m/s  right m/s   yaw rate    (deg/s)   per raw of diff")
+    rows, sign = [], 1
+    for d in diffs:
+        left, right = mean - d / 2.0, mean + d / 2.0
+        drive.driver.set_raw(sign * left, sign * right)
+        clock.sleep(0.4)
+        a, t0 = drive.read_encoders(), clock.monotonic()
+        clock.sleep(0.6)
+        b, t1 = drive.read_encoders(), clock.monotonic()
+        drive.stop()
+        clock.sleep(0.5)
+        dt = max(t1 - t0, 1e-3)
+        lv = (b[0] - a[0]) * sign / dt / ticks_per_m
+        rv = (b[1] - a[1]) * sign / dt / ticks_per_m
+        yaw = (rv - lv) / track_m                      # rad/s, + = left (when going forward)
+        deg = math.degrees(yaw)
+        rows.append((d, lv, rv, deg))
+        per = f"{deg / d:6.2f}" if d else "     -"
+        print(f"   {d:6d}    {lv:7.3f}   {rv:7.3f}   {yaw:+7.2f} rad/s  {deg:+7.1f}   {per}")
+        sign = -sign
+    dead = next((r[0] for r in rows if r[0] and abs(r[3]) >= 5.0), None)
+    print("   (a dead band shows as: no yaw until the raw difference gets big, then it jumps)")
+    if dead:
+        print(f"   first difference giving >= 5 deg/s: {dead}")
+    return rows
+
+
 def ask(prompt):
     try:
         return input(prompt)
@@ -191,7 +235,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__)
     ap.add_argument("--seconds", type=float, default=2.5)
-    ap.add_argument("--only", type=int, choices=(1, 2, 3, 4))
+    ap.add_argument("--only", type=int, choices=(1, 2, 3, 4, 5))
     ap.add_argument("--speed", type=float, default=None, help="m/s (default: the nav's SEARCH_SPEED)")
     args = ap.parse_args()
 
@@ -207,7 +251,7 @@ def main():
     print(f"main.py:   TICKS_PER_M={M.TICKS_PER_M:.0f}  speed {v:.2f} m/s  "
           f"HEADING_HOLD_GAIN={M.HEADING_HOLD_GAIN}  MAX_STEER_RATE={M.MAX_STEER_RATE}")
     try:
-        steps = [args.only] if args.only else [1, 2, 3, 4]
+        steps = [args.only] if args.only else [1, 2, 3, 4, 5]
         for n in steps:
             ask(f"\nStep {n}: robot on clear floor, facing a metre or more of space. Enter to go... ")
             if n == 1:
@@ -220,6 +264,8 @@ def main():
                 step2_open_loop(drive, odo, args.seconds, M.TICKS_PER_M, v)
             elif n == 4:
                 step4_speed_curve(drive, M.TICKS_PER_M)
+            elif n == 5:
+                step5_yaw_response(drive, odo, M.TICKS_PER_M, M.EFFECTIVE_TRACK_M)
             else:
                 step3_hold(drive, odo, args.seconds, M.TICKS_PER_M, v,
                            M.HEADING_HOLD_GAIN, M.MAX_STEER_RATE)
