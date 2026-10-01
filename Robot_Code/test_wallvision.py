@@ -195,16 +195,21 @@ class _Clock:
         self.w = 0.0                 # commanded yaw rate, rad/s (+ = left)
         self.yaw = 0.0               # TRUE yaw against the walls
         self.slip = 0.6              # the chassis really turns 60% of what's commanded
+        self.deadband = 0.0          # pulses shorter than this turn nothing (motor dead band)
     def monotonic(self): return self.t
-    def sleep(self, s): self.advance(s)
+    def sleep(self, s):
+        if s >= self.deadband:       # a pulse (the loop's sleeps are all advance())
+            self.advance(s)
+        else:
+            self.t += s
     def advance(self, dt):
         self.yaw += self.w * dt * self.slip
         self.t += dt
 
 
-def _closed_loop(start_deg, slip=0.6):
+def _closed_loop(start_deg, slip=0.6, deadband=0.0):
     clock = _Clock()
-    clock.yaw, clock.slip = math.radians(start_deg), slip
+    clock.yaw, clock.slip, clock.deadband = math.radians(start_deg), slip, deadband
     real_time = M.time
     M.time = types.SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep)
 
@@ -235,15 +240,42 @@ def _closed_loop(start_deg, slip=0.6):
             n.mover.update()
             clock.advance(0.05)
             ticks += 1
-        return math.degrees(clock.yaw), clock.t - 1000.0, n.mover.phase
+        return math.degrees(clock.yaw), clock.t - 1000.0, n.mover.phase, n.odo.theta
     finally:
         M.time = real_time
 
 
-for start in (15, -15, 6):
-    yaw, took, phase = _closed_loop(start)
+for start in (9, -9, 6):
+    yaw, took, phase, _th = _closed_loop(start)
     check(f"starts {start:+d} deg off -> ends {yaw:+.1f} deg, {took:.2f}s, then drives",
           abs(yaw) <= 2.0 and phase == M.Mover.DRIVE and took < 1.5)
+
+# the two ways it went wrong on the robot
+yaw, took, phase, _th = _closed_loop(8, deadband=0.05)      # 60 ms pulses fall in the dead band
+check(f"pulses too short to turn anything get longer until they do: 8 -> {yaw:+.1f} deg",
+      abs(yaw) <= 4.5 and phase == M.Mover.DRIVE)
+yaw, took, phase, _th = _closed_loop(8, slip=-0.6)          # the robot turns the OTHER way
+check(f"yaw gets worse -> gives up instead of spinning away: 8 -> {yaw:+.1f} deg in {took:.2f}s",
+      phase == M.Mover.DRIVE and took < 1.0 and abs(yaw) < 20)
+check("...and doesn't snap the heading estimate to a reading that isn't tracking it",
+      abs(_th - M.HEADING_RAD[0] - math.radians(8) * 0.4) < 0.05)
+
+print("8d) something bright at the bottom of the frame isn't a wall right ahead")
+_f = render((CELL / 2, CELL / 2 + CAM_FORWARD), math.pi / 2, corridor(3))
+_clean = WallCamera(CAM_H, CAM_TILT, HFOV, VFOV).look(_f)
+_g = _f.copy()
+_g[int(FRAME_H * 0.88):, int(FRAME_W * 0.25):int(FRAME_W * 0.75)] = (235, 235, 235)   # chassis / glare
+_dirty = WallCamera(CAM_H, CAM_TILT, HFOV, VFOV).look(_g)
+check("a bright patch low in the middle of the frame: not 'close'", not _dirty.front_close,
+      f"front_close {_dirty.front_close}")
+check("...and the real wall ahead is still ranged the same",
+      _dirty.front_m is not None and abs(_dirty.front_m - _clean.front_m) < 0.03,
+      f"{_dirty.front_m} vs {_clean.front_m}")
+check("...and the side walls are untouched", near(_dirty.left_m, _clean.left_m, 0.01)
+      and near(_dirty.right_m, _clean.right_m, 0.01))
+_full = np.full((FRAME_H, FRAME_W, 3), 235, np.uint8)
+check("a genuine wall filling the whole frame is still 'close'",
+      WallCamera(CAM_H, CAM_TILT, HFOV, VFOV).look(_full).front_close)
 
 print("9) speed")
 import time

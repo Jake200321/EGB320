@@ -45,6 +45,10 @@ WALL_S_MAX = 28             # ...and at most this colourful (HSV saturation, 0-2
                             # Carpet reads ~33-40, a warm-lit wall ~25. If carpet leaks
                             # into the mask lower this; if walls drop out raise it.
 MIN_RUN_PX = 4              # a wall is this many bright rows in a row (kills specks)
+BOTTOM_TALL = 0.85          # a bright patch touching the bottom of the frame is only a
+                            # wall if it's this much of the way up to the horizon: a wall
+                            # that close fills the frame, glare or the robot's own chassis
+                            # doesn't. (A bright floor patch / chassis = a phantom wall.)
 POST_GAP_PX = 5             # dark posts every panel cut the wall into strips; gaps
                             # this narrow (at WORK_WIDTH) are bridged
 WORK_WIDTH = 160            # frames are shrunk to this wide first: plenty for the
@@ -61,6 +65,8 @@ SIDE_INLIER_M = 0.015       # a boundary point this near the fitted line is on t
 SIDE_MIN_POINTS = 6
 SIDE_MIN_SPREAD_M = 0.06    # ...spread over at least this much forward distance
 SIDE_MAX_SLOPE = 0.45       # a wall more than ~24 deg off the heading isn't "alongside"
+SIDE_MAX_DIST_M = 0.25      # a "side wall" further out than this is the NEXT corridor's:
+                            # half a cell is 14 cm, so 25 leaves room to be well off centre
 YAW_AGREE_RAD = 0.10        # the two side walls' angles must agree to within ~6 deg
 FRONT_LINE_DEG = 22.0       # columns this far off the nose can be on the wall ahead
 FRONT_LINE_MIN_POINTS = 8   # a front wall's angle needs this many boundary points...
@@ -139,6 +145,7 @@ class WallCamera:
         mask = ((hsv[:, :, 2] >= WALL_V_MIN) & (hsv[:, :, 1] <= WALL_S_MAX))
         mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, self._open)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._bridge)   # across the posts
+        mask = self._drop_bottom_patches(mask)
         # run[y, x] true when the MIN_RUN_PX rows ending at y are all wall
         run = cv2.erode(mask, self._kernel, anchor=(0, MIN_RUN_PX - 1)) > 0
 
@@ -179,6 +186,27 @@ class WallCamera:
                         left[0] if left else None, right[0] if right else None,
                         left[1] if left else None, right[1] if right else None,
                         int(usable.sum()), yaw, src)
+
+    @staticmethod
+    def _drop_bottom_patches(mask):
+        """Clear bright runs rising from the bottom edge that stop short of the horizon.
+
+        A wall within ~21 cm of the lens fills the frame from the bottom edge to the top,
+        so its bright run reaches the horizon (the middle row, level camera). Anything that
+        starts at the bottom edge and ends before that isn't a wall: it's glare on the
+        floor, or part of the robot. Left in, it reads as "a wall right in front" and the
+        nav marks a phantom.
+        """
+        H = mask.shape[0]
+        horizon = H // 2
+        dark_from_bottom = mask[::-1, :] == 0
+        run = np.where(dark_from_bottom.any(axis=0), np.argmax(dark_from_bottom, axis=0), H)
+        patch = (run > 0) & (run < BOTTOM_TALL * (H - horizon))
+        if patch.any():
+            rows = np.arange(H)[:, None]
+            mask = mask.copy()
+            mask[(rows >= (H - run)[None, :]) & patch[None, :]] = 0
+        return mask
 
     def _yaw(self, left, right, Z, X, usable, bearing):
         """Robot yaw against the walls: from the side walls if seen, else the wall ahead.
@@ -256,7 +284,7 @@ class WallCamera:
         if zi.max() - zi.min() < SIDE_MIN_SPREAD_M:
             return None
         b, a = np.polyfit(zi, di, 1)
-        if abs(b) > SIDE_MAX_SLOPE or a <= 0:
+        if abs(b) > SIDE_MAX_SLOPE or a <= 0 or a / math.sqrt(1.0 + b * b) > SIDE_MAX_DIST_M:
             return None
         return float(a / math.sqrt(1.0 + b * b)), float(b), idx[best]
 

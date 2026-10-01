@@ -950,5 +950,33 @@ with contextlib.redirect_stdout(_buf):
 check("status line is cut to the terminal width", len(_buf.getvalue().strip("\r")) <
       shutil_cols if (shutil_cols := __import__("shutil").get_terminal_size().columns) else True)
 
+print("24) a camera that contradicts the sonar is ignored for a while")
+_ev = []
+_orig_ev = M.STATUS.event
+M.STATUS.event = lambda msg: _ev.append(msg)
+n = M.Nav(LogDrive(), FakeVision([None]), FakeLeds(), _Front(0.80), wall_camera=object())
+n.cam_walls = view(front_close=True)
+check("before it has disagreed, the camera view is used", n._camera_view() is not None)
+for _i in range(M.CAMERA_DISAGREE_TICKS):
+    n.cam_walls = view(front_close=True)
+    n._check_camera_agrees()
+n.cam_walls = view(front_close=True, left_m=0.14, right_m=0.14, yaw_rad=0.05)
+check("after the camera keeps saying 'wall ahead' against a far sonar, its view is not acted on",
+      n._camera_view() is None)
+check("...so it can't add walls, steer the centring, or square up",
+      n._camera_sees_wall("front") is None and n.mover._camera_offset() is None
+      and n.mover._wall_yaw() == (None, None))
+n._cam_suspect_until = 0.0
+check("...and it comes back once the window has passed", n._camera_view() is not None)
+for _i in range(M.CAMERA_DISAGREE_TICKS * 3):
+    n.cam_walls = view(front_close=True)
+    n._check_camera_agrees()
+check("the warning is rate-limited, not printed every few frames",
+      sum("WARNING: the camera says a wall" in e for e in _ev) <= 2)
+M.STATUS.event = _orig_ev
+
+n, d = mover_nav(yaw=0.30)                       # 17 deg: past what the camera can measure
+check("a wall angle bigger than CAMERA_YAW_MAX_RAD is not trusted", n.mover._wall_yaw() == (None, None))
+
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)

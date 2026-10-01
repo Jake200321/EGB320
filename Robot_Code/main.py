@@ -228,7 +228,8 @@ CAMERA_DISAGREE_TICKS = 15  # camera says "wall right ahead" against a clear fro
 # heading error -- measured, where the encoders only integrate it and drift. While
 # driving, the heading estimate is pulled this far towards it per fresh frame:
 CAMERA_YAW_NUDGE = 0.35
-CAMERA_YAW_MAX_RAD = 0.35   # ignore a "yaw" bigger than ~20 deg: that's a bad reading
+CAMERA_YAW_MAX_RAD = 0.20   # ignore a "yaw" bigger than ~11 deg: after a turn the encoders
+                            # are never that far out, so that's a bad reading
 # After every turn on the spot, square up to the walls before driving off: short
 # pulses, each followed by a fresh frame, until it's parallel. The pivot floor is
 # ~6 deg per control tick, far too coarse to creep up on the walls continuously.
@@ -237,7 +238,19 @@ ALIGN_TOL_RAD = 0.02        # ~1.1 deg: square enough
 ALIGN_SETTLE_S = 0.12       # let it stop and the camera catch up before measuring
 ALIGN_WAIT_S = 0.35         # no wall angle to be had by then -> drive on without it
 ALIGN_MAX_S = 1.5           # never spend longer than this squaring up
-ALIGN_MAX_PULSE_S = 0.06    # longest single pulse (~7 deg at the pivot floor)
+ALIGN_MAX_PULSE_S = 0.06    # first pulse length (~7 deg at the pivot floor if it bites)
+# A pulse this short can fall inside the motors' dead band and turn nothing; the next
+# one is made longer, up to ALIGN_PULSE_CAP_S. And if the yaw gets WORSE (or nothing
+# helps), squaring up is abandoned rather than chasing a reading that isn't tracking the
+# robot -- driving off as it was beats driving off further out.
+ALIGN_PULSE_CAP_S = 0.30
+ALIGN_PULSE_GROWTH = 1.6
+ALIGN_NO_EFFECT_RAD = 0.008 # a pulse that changed the yaw by less than ~0.5 deg did nothing
+ALIGN_DIVERGE_RAD = 0.012   # ...and one that made it ~0.7 deg worse went the wrong way
+                            # (small, because the camera under-reads a growing angle)
+ALIGN_GIVE_UP = 2           # this many bad pulses in a row (diverging) -> give up
+ALIGN_NO_EFFECT_GIVE_UP = 5 # ...or this many that did nothing, even lengthened
+CAMERA_SUSPECT_S = 10.0     # camera contradicts the sonar -> ignore it this long
 
 # --- localisation: odometry corrected by the sonars against the map ------------
 # Each sonar reading is compared with the range the map predicts from where the
@@ -931,6 +944,10 @@ class Mover:
         self.align_ready = now + ALIGN_SETTLE_S     # frames older than this saw it moving
         self.align_seen = False
         self.align_first = None                     # yaw when it started, for the log
+        self.align_min = 0.0                        # shortest pulse to use; grows if they do nothing
+        self.align_last_pulse = 0.0
+        self.align_last = None                      # yaw before the last pulse
+        self.align_worse = self.align_idle = 0      # bad pulses in a row, by kind
 
     def _wall_yaw(self, newer_than=None):
         """Robot yaw against the walls from the latest wall view, rad, + = turned left;
@@ -953,6 +970,15 @@ class Mover:
         now = time.monotonic()
         elapsed = now - self.phase_started
         yaw, _ = self._wall_yaw(newer_than=self.align_ready)
+        if yaw is None and self.align_seen:
+            # A fresh frame it can't get an angle from (walls out of view, or turned past
+            # what the camera can measure) is a reading that's stopped tracking: stop here.
+            view = self.camera_view() if self.camera_view else None
+            if view is not None and view.t >= self.align_ready:
+                STATUS.event(f"[nav] squaring up lost the walls after {elapsed:.2f}s (last yaw "
+                             f"{math.degrees(self.align_last or 0):+.1f} deg) -- driving on")
+                self._begin_drive(now)
+                return None
         if yaw is None:
             if (not self.align_seen and elapsed > ALIGN_WAIT_S) or elapsed > ALIGN_MAX_S:
                 if not self.align_seen:
@@ -962,15 +988,43 @@ class Mover:
         self.align_seen = True
         if self.align_first is None:
             self.align_first = yaw
-        if abs(yaw) <= ALIGN_TOL_RAD or elapsed > ALIGN_MAX_S:
+        if abs(yaw) <= ALIGN_TOL_RAD:
             self.odo.theta = wrap(self.heading + yaw)
             STATUS.event(f"[nav] squared up to the walls: {math.degrees(self.align_first):+.1f}"
                          f" -> {math.degrees(yaw):+.1f} deg off in {elapsed:.2f}s")
             self._begin_drive(now)
             return None
+        # Did the last pulse help? Judge it by how the yaw moved.
+        if self.align_last is not None:
+            gain = abs(self.align_last) - abs(yaw)            # + = got closer
+            if gain < -ALIGN_DIVERGE_RAD:
+                self.align_worse += 1
+                self.align_idle = 0
+            elif gain < ALIGN_NO_EFFECT_RAD:
+                self.align_idle += 1
+                self.align_worse = 0
+                # that pulse did nothing: it was probably inside the motors' dead band, so
+                # the next must be longer than it (and than any proportional pulse)
+                self.align_min = min(ALIGN_PULSE_CAP_S,
+                                     max(self.align_min, self.align_last_pulse) * ALIGN_PULSE_GROWTH)
+            else:
+                self.align_worse = self.align_idle = 0
+        if (self.align_worse >= ALIGN_GIVE_UP or self.align_idle >= ALIGN_NO_EFFECT_GIVE_UP
+                or elapsed > ALIGN_MAX_S):
+            why = ("the yaw got worse" if self.align_worse >= ALIGN_GIVE_UP else
+                   "the pulses turned nothing" if self.align_idle >= ALIGN_NO_EFFECT_GIVE_UP
+                   else "out of time")
+            STATUS.event(f"[nav] squaring up gave up ({why}): {math.degrees(self.align_first):+.1f}"
+                         f" -> {math.degrees(yaw):+.1f} deg after {elapsed:.2f}s -- driving on, "
+                         "heading left as the encoders have it")
+            self._begin_drive(now)
+            return None
         # turned left (+) -> pulse right, and vice versa
         rate = MIN_TURN_RATE_PIVOT
-        pulse = min(ALIGN_MAX_PULSE_S, max(0.01, abs(yaw) / rate))
+        pulse = min(ALIGN_PULSE_CAP_S,
+                    max(self.align_min, min(ALIGN_MAX_PULSE_S, max(0.01, abs(yaw) / rate))))
+        self.align_last_pulse = pulse
+        self.align_last = yaw
         self.drive.set_velocity(0.0, -math.copysign(rate, yaw))
         time.sleep(pulse)
         self.drive.stop()
@@ -1453,6 +1507,8 @@ class Nav:
         self.wallcam = wall_camera       # wallvision.WallCamera, or None for sonar only
         self.cam_walls = None            # latest wallvision.WallView
         self._cam_disagree = 0           # consecutive frames the camera contradicted the sonar
+        self._cam_suspect_until = 0.0    # camera ignored until then (it contradicted the sonar)
+        self._cam_warned_at = -1e9
         self._wall_frame = None          # the frame it was computed from
         self.sonar = sonar if sonar is not None else Ultrasonics(enabled=False)
         self.state = SEARCH
@@ -1700,12 +1756,17 @@ class Nav:
             self._cam_disagree += 1
         else:
             self._cam_disagree = 0
-        if self._cam_disagree == CAMERA_DISAGREE_TICKS:
-            STATUS.event(f"[walls] WARNING: the camera says a wall is right ahead but the front "
-                         f"sonar reads {front*100:.0f}cm -- the camera view is probably catching "
-                         "something bright at the bottom of the frame (chassis? glare?). It's being "
-                         "overruled by the sonar; run  python3 wall_vision_test.py --save  facing "
-                         "down the corridor and check runs/*_mask.png")
+        if self._cam_disagree >= CAMERA_DISAGREE_TICKS:
+            now = time.monotonic()
+            self._cam_suspect_until = now + CAMERA_SUSPECT_S      # ignore it for a while
+            if now - self._cam_warned_at > 30.0:
+                self._cam_warned_at = now
+                STATUS.event(f"[walls] WARNING: the camera says a wall is right ahead but the "
+                             f"front sonar reads {front*100:.0f}cm -- the camera view is probably "
+                             "catching something bright at the bottom of the frame (chassis? "
+                             "glare?). Ignoring the camera's walls for "
+                             f"{CAMERA_SUSPECT_S:.0f}s; run  python3 wall_vision_test.py --save  "
+                             "facing down the corridor and check runs/*_mask.png")
 
     def _camera_summary(self):
         view = self._camera_view()
@@ -1722,6 +1783,8 @@ class Nav:
         view = self.cam_walls
         if view is None or view.age() > CAMERA_FRESH_S:
             return None
+        if time.monotonic() < self._cam_suspect_until:
+            return None                  # it's been contradicting the sonar: don't act on it
         return view
 
     def front_distance(self):
