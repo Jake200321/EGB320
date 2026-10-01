@@ -89,9 +89,12 @@ ULTRASONIC_PINS = {
 # The maze nav needs all three: front to stop at walls, sides to map and centre.
 SONARS_FITTED = ("front", "left", "right")
 
-US_MAX_RANGE_M = 2.0        # ignore anything past this -- beyond the maze anyway
-US_MIN_TRIGGER_GAP_S = 0.06 # HC-SR04 wants >60 ms between pings; sensors are fired
-                            # one at a time so their echoes can't be confused
+US_MAX_RANGE_M = 1.0        # ignore anything past this -- a cell is 28 cm. Also caps
+                            # how long a missed echo blocks the loop (~6 ms per metre)
+US_MIN_TRIGGER_GAP_S = 0.03 # sensors are fired one at a time, and each ping waits out its
+                            # own echo, so the gap only has to let reverberation die
+                            # (<~20 ms at these ranges). Was 0.06, which at 20 Hz
+                            # ticks meant a ping every 100 ms
 US_STALE_AFTER_S = 0.5      # a reading older than this is discarded, not reused
 US_TRUST_BEARING_DEG = 10.0 # only believe the front sonar is ranging the VICTIM
                             # when the victim is this close to centre -- the cone
@@ -609,14 +612,16 @@ class Ultrasonic:
 class Ultrasonics:
     """All three sensors, fired one per tick so they never overlap.
 
-    Front is polled twice as often as the sides: it's the input to the stop decision,
-    where the sides only inform wall logic. Readings go stale rather than lingering --
+    All three are polled equally often: the sides drive corridor centring, so they
+    can't be starved for the front. Readings go stale rather than lingering --
     a 2-second-old range is worse than admitting you don't know.
     """
 
-    # front, left, front, right -- front lands on half the ticks. Anything not in
-    # SONARS_FITTED is skipped, so with only the front fitted it gets every tick.
-    ORDER = ["front", "left", "front", "right"]
+    # One ping per tick, round robin: each side is read every 3rd tick (~7 Hz) rather
+    # than every 4th at half the ping rate. Centring runs off the sides, so they must
+    # not lag. Anything not in SONARS_FITTED is skipped, so with only the front fitted
+    # it gets every tick.
+    ORDER = ["front", "left", "right"]
 
     def __init__(self, pins=None, enabled=True):
         self.sensors = {}
