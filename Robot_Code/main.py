@@ -152,8 +152,8 @@ EFFECTIVE_TRACK_M = 0.16
 
 # --- sonar geometry: MEASURE with  python3 main.py --calibrate sonar -----------
 # What each sonar reads with the robot centred in a cell and a wall right there.
-FRONT_WALL_AT_CENTRE_M = 0.045
-SIDE_WALL_AT_CENTRE_M = 0.050
+FRONT_WALL_AT_CENTRE_M = 0.060
+SIDE_WALL_AT_CENTRE_M = 0.079
 # A wall counts as present when the reading is within this of those. Deliberately
 # tight rather than half a cell: a victim or rubble standing in the NEXT cell reads
 # ~15 cm, and calling that a wall would seal off the very cell the victim is in.
