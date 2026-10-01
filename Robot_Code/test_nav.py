@@ -1121,6 +1121,26 @@ _dp.set_raw(0, 100)
 check("swinging on one track (the other stopped) still trims", _fbp.sent == (0, 80))
 MOT.LEFT_TRIM, MOT.RIGHT_TRIM, MOT.SWAP_MOTORS, MOT.LEFT_SIGN, MOT.RIGHT_SIGN = _saved
 
+print("25c) which way it physically turns (step 6)")
+
+
+def _step6(answer, **kw):
+    clock = _Clock(); drive = _Tracks(clock, **kw)
+    odo = M.Odometry(M.TICKS_PER_M, M.EFFECTIVE_TRACK_M)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ok = ST.step6_physical_direction(drive, odo, clock, answer=answer)
+    return ok, buf.getvalue()
+
+
+ok, out = _step6("l")
+check("turned left as commanded (odometry + and the user saw LEFT) -> OK", ok is True)
+ok, out = _step6("r")
+check("odometry says left but the robot visibly went RIGHT -> MIRRORED, names SWAP_MOTORS",
+      ok is False and "MIRRORED" in out and "SWAP_MOTORS" in out)
+ok, out = _step6("")
+check("no answer -> doesn't pretend to judge", ok is None)
+
 print("26) --no-centring drives on the encoder heading alone")
 n = M.Nav(LogDrive(), FakeVision([None]), FakeLeds(), _Sides(0.14, 0.02))   # wall hard on the right
 n.odo.theta = M.HEADING_RAD[0]

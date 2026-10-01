@@ -2,7 +2,7 @@
 
     python3 straight_test.py                # all three steps, ~2.5 s of driving each
     python3 straight_test.py --seconds 3    # longer runs
-    python3 straight_test.py --only 5       # just one step (1-5)
+    python3 straight_test.py --only 6       # just one step (1-6; 6 asks which way it turned)
 
 Give it a metre or more of clear floor ahead. It asks before every run.
 
@@ -15,6 +15,11 @@ Give it a metre or more of clear floor ahead. It asks before every run.
   3. HEADING HOLD -- the same drive with the encoder heading hold the maze nav uses.
      Reports how far the heading wandered. If this is worse than step 2, the controller
      is the problem rather than the motors.
+  6. WHICH WAY IT REALLY TURNS -- commands a LEFT pivot and asks you which way the robot
+     physically went. Step 1 only proves the command and the encoders agree with EACH
+     OTHER; if both are mirrored against the real robot, everything is internally
+     consistent and every correction (leaning to the centre, squaring up, turning at
+     corners) goes the wrong way in the real maze.
   4. SPEED CURVE -- each raw motor command in turn (forward, then back, so it stays put),
      with the speed the encoders actually measured. This is what the controller's idea of
      "0.13 m/s" or "turn at 0.8 rad/s" has to match; when it doesn't, every correction the
@@ -149,6 +154,50 @@ def step3_hold(drive, odo, seconds, ticks_per_m, v, gain, max_rate):
     return r
 
 
+def step6_physical_direction(drive, odo, clock=time, answer=None):
+    """Spin LEFT briefly and compare the odometry's idea of it with what you saw.
+
+    `answer` (tests only) stands in for typing "l" or "r".
+    """
+    print("\n6) WHICH WAY IT REALLY TURNS -- WATCH THE ROBOT. It will spin on the spot to its LEFT\n"
+          "   (counter-clockwise seen from above, towards the robot's own left side) for a moment.")
+    r = drive_run(drive, odo, 0.5, 0.0, lambda o: MOT_PIVOT, "left pivot", clock)
+    print(f"   left track {r['dl']} ticks, right track {r['dr']} ticks; the odometry says it turned "
+          f"{r['heading']:+.0f} deg ({'LEFT' if r['heading'] > 0 else 'RIGHT'})")
+    if answer is None:
+        answer = ask("   Which way did it ACTUALLY turn, seen from above? l = left, r = right: ")
+    seen = answer.strip().lower()[:1]
+    if seen not in ("l", "r"):
+        print("   (no answer -- can't judge)")
+        return None
+    odo_left = r["heading"] > 0
+    real_left = seen == "l"
+    if real_left and odo_left:
+        print("   OK: it turned LEFT, as commanded and as the odometry says.")
+        return True
+    if (not real_left) and odo_left:
+        print("   !! MIRRORED. It was told to turn left and the odometry says it did, but it "
+              "physically turned RIGHT.\n      So everything the nav does is mirrored in the real "
+              "maze: it leans towards the nearer wall, squares up the wrong way,\n      turns the "
+              "wrong way at corners. The motor channels and the encoder channels are both wired to "
+              "the opposite tracks.\n"
+              f"      Set  SWAP_MOTORS = {not MOT.SWAP_MOTORS}  in motors.py (it is {MOT.SWAP_MOTORS} "
+              "now) -- that swaps the motors AND the encoders -- then run this step again.")
+        return False
+    if real_left and not odo_left:
+        print("   !! The robot turned LEFT but the odometry says RIGHT: the encoders are on the "
+              "opposite tracks to the motors.\n      Step 1 should have flagged it. Check "
+              "ENCODER_LEFT_SIGN / ENCODER_RIGHT_SIGN and SWAP_MOTORS, then rerun steps 1 and 6.")
+        return False
+    print("   It turned RIGHT and the odometry also says RIGHT: a left command is turning it right "
+          "and the encoders agree.\n      Both motor signs are probably inverted for turning -- try "
+          f"SWAP_MOTORS = {not MOT.SWAP_MOTORS}, then rerun steps 1 and 6.")
+    return False
+
+
+MOT_PIVOT = 2.2        # rad/s, the nav's pivot floor -- what a heading trim uses
+
+
 SPEED_CURVE_RAWS = (45, 55, 65, 80, 100, 127)
 
 
@@ -235,7 +284,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__)
     ap.add_argument("--seconds", type=float, default=2.5)
-    ap.add_argument("--only", type=int, choices=(1, 2, 3, 4, 5))
+    ap.add_argument("--only", type=int, choices=(1, 2, 3, 4, 5, 6))
     ap.add_argument("--speed", type=float, default=None, help="m/s (default: the nav's SEARCH_SPEED)")
     args = ap.parse_args()
 
@@ -251,7 +300,7 @@ def main():
     print(f"main.py:   TICKS_PER_M={M.TICKS_PER_M:.0f}  speed {v:.2f} m/s  "
           f"HEADING_HOLD_GAIN={M.HEADING_HOLD_GAIN}  MAX_STEER_RATE={M.MAX_STEER_RATE}")
     try:
-        steps = [args.only] if args.only else [1, 2, 3, 4, 5]
+        steps = [args.only] if args.only else [1, 6, 2, 3, 4, 5]
         for n in steps:
             ask(f"\nStep {n}: robot on clear floor, facing a metre or more of space. Enter to go... ")
             if n == 1:
@@ -266,6 +315,11 @@ def main():
                 step4_speed_curve(drive, M.TICKS_PER_M)
             elif n == 5:
                 step5_yaw_response(drive, odo, M.TICKS_PER_M, M.EFFECTIVE_TRACK_M)
+            elif n == 6:
+                ok = step6_physical_direction(drive, odo)
+                if ok is False and not args.only:
+                    print("\nFix that first -- every later step assumes left is left.")
+                    break
             else:
                 step3_hold(drive, odo, args.seconds, M.TICKS_PER_M, v,
                            M.HEADING_HOLD_GAIN, M.MAX_STEER_RATE)
