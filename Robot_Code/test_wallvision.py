@@ -147,6 +147,25 @@ walls = [(CELL, 0.0, CELL, 3 * CELL), (0.0, 3 * CELL, CELL, 3 * CELL)]   # left 
 v, _ = view_from(CELL / 2, 0, walls)
 check("left reads open despite the end wall in its half", v.left_m is None, f"got {v.left_m}")
 
+print("8b) a REAL photo from the maze (test_images/real_corridor.png)")
+# White panels with dark posts, beige carpet, uneven light -- the case the synthetic
+# corridors can't cover. Robot is roughly centred looking down a 3-cell corridor, so:
+# both walls about half a cell off, the far wall most of a metre away.
+import os
+_photo = cv2.imread(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "test_images", "real_corridor.png"))
+if _photo is None:
+    print("  SKIP  test_images/real_corridor.png missing")
+else:
+    v = WallCamera(CAM_H, CAM_TILT, HFOV, VFOV).look(_photo)
+    check("left wall found at roughly half a cell", v.left_m is not None and 0.10 <= v.left_m <= 0.22,
+          f"got {v.left_m}")
+    check("right wall found at roughly half a cell", v.right_m is not None and 0.10 <= v.right_m <= 0.22,
+          f"got {v.right_m}")
+    check("far wall found 60-110 cm away", v.front_m is not None and 0.6 <= v.front_m <= 1.1,
+          f"got {v.front_m}")
+    check("not mistaken for a wall right in front", not v.front_close)
+
 print("9) speed")
 import time
 frame = render((0.14, 0.2), math.pi / 2, corridor(3))

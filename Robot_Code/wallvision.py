@@ -7,9 +7,9 @@ vertical field), but it sees the whole corridor beyond that in one frame, 20 tim
 second -- both walls at once, their distance, and which way the robot is pointing
 against them.
 
-HOW: walls are bright and unsaturated, the floor isn't (thresholds in vision/config.py
-call them wall_luminance_min / wall_saturation_max). In each image column the lowest
-bright run is the wall/floor boundary. That row is on the floor, so with the camera
+HOW: the walls are neutral white panels, the floor is warm beige carpet -- so the test
+is saturation (carpet ~35, walls ~7-25), not brightness, which shadow ruins. In each
+image column the lowest wall-coloured run is the wall/floor boundary. That row is on the floor, so with the camera
 height and tilt it fixes a ground point (forward Z, right X) exactly -- the same
 geometry the victim ranging uses. Then:
 
@@ -35,12 +35,18 @@ import cv2
 import numpy as np
 
 # --- appearance: TUNE on the real maze ----------------------------------------
-WALL_V_MIN = 160            # wall pixels are at least this bright (HSV value, 0-255)...
-WALL_S_MAX = 65             # ...and at most this colourful (HSV saturation, 0-255).
-                            # Same numbers as wall_luminance_min / wall_saturation_max
-                            # in vision/config.py. A shadow at the wall foot makes the
-                            # boundary read too FAR -- lower WALL_V_MIN if so.
+# Measured on a photo from the real maze (white panels, beige carpet, uneven light):
+#     carpet   V 117-148   S 31-38      walls (lit or shaded)   V 140-189   S 7-19
+# Brightness can't separate them -- a shaded wall (V~144) is as dark as the carpet --
+# but saturation can: the carpet is warm, the walls are neutral. So the test is mostly
+# "not colourful", with V_MIN only there to throw out the black posts and the gaps.
+WALL_V_MIN = 90             # at least this bright (HSV value, 0-255): drops the posts
+WALL_S_MAX = 28             # ...and at most this colourful (HSV saturation, 0-255).
+                            # Carpet reads ~33-40, a warm-lit wall ~25. If carpet leaks
+                            # into the mask lower this; if walls drop out raise it.
 MIN_RUN_PX = 4              # a wall is this many bright rows in a row (kills specks)
+POST_GAP_PX = 5             # dark posts every panel cut the wall into strips; gaps
+                            # this narrow (at WORK_WIDTH) are bridged
 WORK_WIDTH = 160            # frames are shrunk to this wide first: plenty for the
                             # geometry, and keeps it to a few ms on the Pi
 
@@ -48,7 +54,8 @@ WORK_WIDTH = 160            # frames are shrunk to this wide first: plenty for t
 MAX_RANGE_M = 1.0           # boundary points further than this are too coarse to use
 FRONT_HALF_DEG = 12.0       # middle columns that count as "straight ahead"
 FRONT_CLOSE_FRACTION = 0.6  # of those, this many bright to the bottom = wall is close
-FRONT_MIN_FRACTION = 0.4    # ...or this many with a boundary, to trust a distance
+FRONT_MIN_FRACTION = 0.25   # ...or this many with a boundary, to trust a distance
+                            # (posts and shadows knock holes in a wall's boundary)
 SIDE_MIN_DEG = 6.0          # side fits use columns at least this far off the nose
 SIDE_INLIER_M = 0.015       # a boundary point this near the fitted line is on the wall
 SIDE_MIN_POINTS = 6
@@ -84,6 +91,7 @@ class WallCamera:
         self._rng = np.random.default_rng(0)
         self._kernel = np.ones((MIN_RUN_PX, 1), np.uint8)
         self._open = np.ones((3, 3), np.uint8)
+        self._bridge = np.ones((1, POST_GAP_PX), np.uint8)
         self._geom = None            # (W, H) the cached ray table was built for
         # for the debug overlay: boundary points in full-frame pixels
         self.last_boundary = None
@@ -120,6 +128,7 @@ class WallCamera:
         hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
         mask = ((hsv[:, :, 2] >= WALL_V_MIN) & (hsv[:, :, 1] <= WALL_S_MAX))
         mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_OPEN, self._open)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._bridge)   # across the posts
         # run[y, x] true when the MIN_RUN_PX rows ending at y are all wall
         run = cv2.erode(mask, self._kernel, anchor=(0, MIN_RUN_PX - 1)) > 0
 
@@ -136,15 +145,21 @@ class WallCamera:
         centre = np.abs(bearing) <= FRONT_HALF_DEG
         n_centre = max(1, int(centre.sum()))
         close = bool((reaches_bottom & centre).sum() / n_centre >= FRONT_CLOSE_FRACTION)
-        front = None
-        if not close:
-            z = Z[usable & centre]
-            if len(z) / n_centre >= FRONT_MIN_FRACTION:
-                front = float(np.median(z))
-
         # ---- sides ----
         left = self._side(Z, -X, usable & (bearing <= -SIDE_MIN_DEG))
         right = self._side(Z, X, usable & (bearing >= SIDE_MIN_DEG))
+
+        # ---- front distance, from the middle columns -- but not the far ends of the
+        # side walls, which converge into them down a long corridor ----
+        front = None
+        if not close:
+            ahead = usable & centre
+            for side in (left, right):
+                if side:
+                    ahead[side[2]] = False
+            z = Z[ahead]
+            if len(z) / n_centre >= FRONT_MIN_FRACTION:
+                front = float(np.median(z))
 
         sx = (np.arange(W) + 0.5) * (w0 / W)
         self.last_boundary = (sx[usable], v_edge[usable] * (h0 / H))
@@ -156,9 +171,11 @@ class WallCamera:
     def _side(self, Z, dist, sel):
         """Fit |X| = a + b*Z through the boundary points on one side.
 
-        Returns (perpendicular distance camera->wall, slope b) or None. RANSAC, because
+        Returns (perpendicular distance camera->wall, slope b, indices of the columns on
+        the line) or None. RANSAC, because
         the points can include a front wall's, which sit on a different line.
         """
+        idx = np.flatnonzero(sel)
         z, d = Z[sel], dist[sel]
         n = len(z)
         if n < SIDE_MIN_POINTS:
@@ -183,7 +200,7 @@ class WallCamera:
         b, a = np.polyfit(zi, di, 1)
         if abs(b) > SIDE_MAX_SLOPE or a <= 0:
             return None
-        return float(a / math.sqrt(1.0 + b * b)), float(b)
+        return float(a / math.sqrt(1.0 + b * b)), float(b), idx[best]
 
     # -- debug -----------------------------------------------------------------
     def annotate(self, frame, view):

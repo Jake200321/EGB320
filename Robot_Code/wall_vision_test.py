@@ -9,9 +9,9 @@ corridor. You should see  L ~14  R ~14  (cm, half a cell) and F the distance to 
 far wall. The yellow dots in the overlay should sit along the bottom edge of each wall.
 
 If it's wrong, the saved *_mask.png shows what it took for wall (white):
-  * wall has holes / floor is white  -> raise WALL_V_MIN or lower WALL_S_MAX
-  * wall is dark / in shadow         -> lower WALL_V_MIN (in wallvision.py)
-  * boundary reads too far           -> a shadow at the wall foot; lower WALL_V_MIN
+  * carpet shows up white            -> lower WALL_S_MAX (in wallvision.py)
+  * wall has holes / drops out       -> raise WALL_S_MAX, or lower WALL_V_MIN
+  * boundary reads too far           -> a shadow at the wall foot; raise WALL_S_MAX
   * L and R differ when centred      -> camera is off-centre or tilted (check
                                         CAMERA_TILT_DEG / CAMERA_HEIGHT_M)
 """
@@ -72,7 +72,7 @@ def main():
     wc = W.WallCamera(CAMERA_HEIGHT_M, CAMERA_TILT_DEG, HORIZONTAL_FOV_DEG, VERTICAL_FOV_DEG)
     print(f"camera {CAMERA_HEIGHT_M * 100:.0f} cm up, tilt {CAMERA_TILT_DEG} deg, "
           f"{HORIZONTAL_FOV_DEG} x {VERTICAL_FOV_DEG} deg   "
-          f"wall = V >= {W.WALL_V_MIN}, S <= {W.WALL_S_MAX}")
+          f"wall = V >= {W.WALL_V_MIN} and S <= {W.WALL_S_MAX}")
 
     if args.image:
         frame = cv2.imread(args.image)
