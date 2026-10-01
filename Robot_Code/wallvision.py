@@ -61,6 +61,10 @@ SIDE_INLIER_M = 0.015       # a boundary point this near the fitted line is on t
 SIDE_MIN_POINTS = 6
 SIDE_MIN_SPREAD_M = 0.06    # ...spread over at least this much forward distance
 SIDE_MAX_SLOPE = 0.45       # a wall more than ~24 deg off the heading isn't "alongside"
+YAW_AGREE_RAD = 0.10        # the two side walls' angles must agree to within ~6 deg
+FRONT_LINE_DEG = 22.0       # columns this far off the nose can be on the wall ahead
+FRONT_LINE_MIN_POINTS = 8   # a front wall's angle needs this many boundary points...
+FRONT_LINE_MIN_SPREAD_M = 0.10   # ...spread this far sideways
 
 
 @dataclass
@@ -75,6 +79,12 @@ class WallView:
     left_slope: Optional[float]      # d(distance)/d(forward): + = wall falling away
     right_slope: Optional[float]
     columns: int = 0                 # columns with a usable boundary (debug)
+    # How far the robot is turned from the walls, rad, + = turned LEFT of them. From
+    # the side walls' slopes, else the line of the wall ahead; None if neither is
+    # seen well enough. Walls are on the maze grid, so this is the robot's heading
+    # error against the grid, measured -- not integrated from the encoders.
+    yaw_rad: Optional[float] = None
+    yaw_src: Optional[str] = None    # "walls", "wall" (one side) or "front"
 
     def age(self, now=None):
         return (time.monotonic() if now is None else now) - self.t
@@ -161,12 +171,60 @@ class WallCamera:
             if len(z) / n_centre >= FRONT_MIN_FRACTION:
                 front = float(np.median(z))
 
+        yaw, src = self._yaw(left, right, Z, X, usable, bearing)
+
         sx = (np.arange(W) + 0.5) * (w0 / W)
         self.last_boundary = (sx[usable], v_edge[usable] * (h0 / H))
         return WallView(time.monotonic(), close, front,
                         left[0] if left else None, right[0] if right else None,
                         left[1] if left else None, right[1] if right else None,
-                        int(usable.sum()))
+                        int(usable.sum()), yaw, src)
+
+    def _yaw(self, left, right, Z, X, usable, bearing):
+        """Robot yaw against the walls: from the side walls if seen, else the wall ahead.
+
+        A side wall's distance changes along it by slope b: turned left, the left wall
+        closes in ahead (b < 0) and the right falls away (b > 0). So yaw = -atan(b_left)
+        = +atan(b_right). Two walls that disagree mean something's wrong -- say nothing.
+        """
+        yaws = []
+        if left:
+            yaws.append(-math.atan(left[1]))
+        if right:
+            yaws.append(math.atan(right[1]))
+        if len(yaws) == 2:
+            if abs(yaws[0] - yaws[1]) <= YAW_AGREE_RAD:
+                return float(sum(yaws) / 2.0), "walls"
+        elif len(yaws) == 1:
+            return float(yaws[0]), "wall"
+        if len(yaws) == 2:
+            return None, None
+        # no side walls: the line of the wall ahead. Turned left, the wall's right-hand
+        # end is nearer: Z = z0 + m*X  with  yaw = -atan(m).
+        sel = usable & (np.abs(bearing) <= FRONT_LINE_DEG)
+        idx = np.flatnonzero(sel)
+        z, x = Z[sel], X[sel]
+        n = len(z)
+        if n < FRONT_LINE_MIN_POINTS:
+            return None, None
+        best = None
+        for _ in range(40):
+            i, j = self._rng.choice(n, 2, replace=False)
+            if abs(x[i] - x[j]) < 0.03:
+                continue
+            m = (z[j] - z[i]) / (x[j] - x[i])
+            if abs(m) > SIDE_MAX_SLOPE:
+                continue
+            inl = np.abs(z - (z[i] + m * (x - x[i]))) <= SIDE_INLIER_M
+            if best is None or inl.sum() > best.sum():
+                best = inl
+        if best is None or best.sum() < FRONT_LINE_MIN_POINTS:
+            return None, None
+        xi, zi = x[best], z[best]
+        if xi.max() - xi.min() < FRONT_LINE_MIN_SPREAD_M:
+            return None, None
+        m, _ = np.polyfit(xi, zi, 1)
+        return float(-math.atan(m)), "front"
 
     def _side(self, Z, dist, sel):
         """Fit |X| = a + b*Z through the boundary points on one side.
@@ -213,6 +271,7 @@ class WallCamera:
         def cm(v):
             return "--" if v is None else f"{v * 100:.0f}"
         front = "CLOSE" if view.front_close else cm(view.front_m)
-        cv2.putText(out, f"wall cam  L {cm(view.left_m)}  F {front}  R {cm(view.right_m)} cm",
+        yaw = "" if view.yaw_rad is None else f"  yaw {math.degrees(view.yaw_rad):+.1f}deg"
+        cv2.putText(out, f"wall cam  L {cm(view.left_m)}  F {front}  R {cm(view.right_m)} cm{yaw}",
                     (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
         return out

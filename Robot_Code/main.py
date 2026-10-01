@@ -181,8 +181,8 @@ BLOCK_CONFIRM = 3
 
 # Heading hold: the encoders say which way it's pointing, so holding heading is
 # the same thing as not letting either track fall behind the other.
-HEADING_HOLD_GAIN = 3.0     # rad/s per rad of heading error
-MAX_STEER_RATE = 0.8        # rad/s cap while driving
+HEADING_HOLD_GAIN = 4.0     # rad/s per rad of heading error
+MAX_STEER_RATE = 1.0        # rad/s cap while driving
 # Corridor centring: aim this many rad of heading back towards the middle per metre
 # off centre, capped at MAX_CENTRE_ANGLE. 7.0 means 1 cm off -> 4 deg correction.
 # The offset decays at about SEARCH_SPEED * CENTRE_GAIN per second (0.9/s here), so
@@ -204,10 +204,25 @@ SIDE_FRESH_S = 0.35
 #   * mapping: a wall seen by EITHER marks the edge (a missed wall costs a collision,
 #     a phantom one only a detour), except towards a cell a victim is in.
 USE_CAMERA_WALLS = True
-CAMERA_WALL_WEIGHT = 0.5    # camera's share of the centring offset when both agree
+CAMERA_WALL_WEIGHT = 0.7    # camera's share of the centring offset when both agree
+                            # (it updates ~20x a second, the sonars ~7x)
 CAMERA_AGREE_M = 0.03       # ...agree = within this; further apart, trust the sonars
 CAMERA_FRESH_S = 0.30       # a wall view older than this is ignored
 CAMERA_WALL_TOLERANCE_M = 0.04  # camera wall is "this cell's" within half a cell + this
+# The walls are on the maze grid, so the angle the camera measures against them IS the
+# heading error -- measured, where the encoders only integrate it and drift. While
+# driving, the heading estimate is pulled this far towards it per fresh frame:
+CAMERA_YAW_NUDGE = 0.35
+CAMERA_YAW_MAX_RAD = 0.35   # ignore a "yaw" bigger than ~20 deg: that's a bad reading
+# After every turn on the spot, square up to the walls before driving off: short
+# pulses, each followed by a fresh frame, until it's parallel. The pivot floor is
+# ~6 deg per control tick, far too coarse to creep up on the walls continuously.
+ALIGN_AFTER_TURN = True
+ALIGN_TOL_RAD = 0.02        # ~1.1 deg: square enough
+ALIGN_SETTLE_S = 0.12       # let it stop and the camera catch up before measuring
+ALIGN_WAIT_S = 0.35         # no wall angle to be had by then -> drive on without it
+ALIGN_MAX_S = 1.5           # never spend longer than this squaring up
+ALIGN_MAX_PULSE_S = 0.06    # longest single pulse (~7 deg at the pivot floor)
 
 # --- localisation: odometry corrected by the sonars against the map ------------
 # Each sonar reading is compared with the range the map predicts from where the
@@ -383,7 +398,8 @@ def status_text(nav, sonar, leds, hz):
             def cv(x):
                 return " --" if x is None else f"{x*100:3.0f}"
             front = "CLS" if view.front_close else cv(view.front_m)
-            sonar_txt += f" cam L{cv(view.left_m)} F{front} R{cv(view.right_m)}"
+            yaw = "" if view.yaw_rad is None else f" Y{math.degrees(view.yaw_rad):+.0f}"
+            sonar_txt += f" cam L{cv(view.left_m)} F{front} R{cv(view.right_m)}{yaw}"
 
     lit = "".join(c if getattr(leds, "_state", {}).get(n) else "-"
                   for n, c in (("green", "G"), ("yellow", "Y"), ("red", "R")))
@@ -801,7 +817,7 @@ class Mover:
       * backs out if something turns up in the way that the map said was open.
     """
 
-    IDLE, TURN, DRIVE, BACKOUT = "IDLE", "TURN", "DRIVE", "BACKOUT"
+    IDLE, TURN, ALIGN, DRIVE, BACKOUT = "IDLE", "TURN", "ALIGN", "DRIVE", "BACKOUT"
 
     def __init__(self, drive, sonar, odo, camera_view=None):
         self.drive, self.sonar, self.odo = drive, sonar, odo
@@ -829,6 +845,7 @@ class Mover:
         """
         self.target, self.heading, self.grid = (x, y), heading, grid
         self.through = through
+        self._yaw_stamp = None          # last wall view the heading was nudged by
         self.near_since = None          # when it came within ARRIVE_SLOW_M
         self.block_count = 0
         self.block_info = None          # (front reading, distance to go) when blocked
@@ -853,6 +870,8 @@ class Mover:
     def update(self):
         if self.phase == self.TURN:
             return self._turn()
+        if self.phase == self.ALIGN:
+            return self._align()
         if self.phase == self.DRIVE:
             return self._drive()
         if self.phase == self.BACKOUT:
@@ -873,10 +892,65 @@ class Mover:
         if (abs(err) <= TURN_TOLERANCE_RAD or crossed
                 or now - self.phase_started > TURN_TIMEOUT_S):
             self.drive.stop()
-            self._begin_drive(now)
+            if self.camera_view is not None and ALIGN_AFTER_TURN and self.grid:
+                self._begin_align(now)
+            else:
+                self._begin_drive(now)
             return None
         rate = min(SEARCH_TURN_RATE, max(MIN_TURN_RATE_PIVOT, TURN_GAIN * abs(err)))
         self.drive.set_velocity(0.0, math.copysign(rate, err))
+        return None
+
+    def _begin_align(self, now):
+        self.phase = self.ALIGN
+        self.phase_started = now
+        self.align_ready = now + ALIGN_SETTLE_S     # frames older than this saw it moving
+        self.align_seen = False
+        self.align_first = None                     # yaw when it started, for the log
+
+    def _wall_yaw(self, newer_than=None):
+        """Robot yaw against the walls from the latest wall view, rad, + = turned left;
+        None if there isn't a trustworthy one."""
+        view = self.camera_view() if self.camera_view else None
+        if (view is None or view.yaw_rad is None or abs(view.yaw_rad) > CAMERA_YAW_MAX_RAD
+                or (newer_than is not None and view.t < newer_than)):
+            return None, None
+        return view.yaw_rad, view.t
+
+    def _align(self):
+        """Square up to the walls after a turn, so the next leg starts truly parallel.
+
+        Measure the angle to the walls (side walls of the corridor it's now facing, or
+        the wall ahead if it can see one), pulse the tracks to cancel it, wait for a
+        fresh frame, repeat. The walls are on the grid, so being parallel to them is
+        being exactly on the cardinal heading -- and the heading estimate is snapped to
+        it, wiping out whatever the encoders drifted by on the turn.
+        """
+        now = time.monotonic()
+        elapsed = now - self.phase_started
+        yaw, _ = self._wall_yaw(newer_than=self.align_ready)
+        if yaw is None:
+            if (not self.align_seen and elapsed > ALIGN_WAIT_S) or elapsed > ALIGN_MAX_S:
+                if not self.align_seen:
+                    STATUS.event("[nav] turn done, but no wall angle in view -- not squared up")
+                self._begin_drive(now)
+            return None
+        self.align_seen = True
+        if self.align_first is None:
+            self.align_first = yaw
+        if abs(yaw) <= ALIGN_TOL_RAD or elapsed > ALIGN_MAX_S:
+            self.odo.theta = wrap(self.heading + yaw)
+            STATUS.event(f"[nav] squared up to the walls: {math.degrees(self.align_first):+.1f}"
+                         f" -> {math.degrees(yaw):+.1f} deg off in {elapsed:.2f}s")
+            self._begin_drive(now)
+            return None
+        # turned left (+) -> pulse right, and vice versa
+        rate = MIN_TURN_RATE_PIVOT
+        pulse = min(ALIGN_MAX_PULSE_S, max(0.01, abs(yaw) / rate))
+        self.drive.set_velocity(0.0, -math.copysign(rate, yaw))
+        time.sleep(pulse)
+        self.drive.stop()
+        self.align_ready = time.monotonic() + ALIGN_SETTLE_S
         return None
 
     def _drive(self):
@@ -912,6 +986,14 @@ class Mover:
             STATUS.event("[nav] no arrival in time -- treating the cell as blocked")
             self.block_info = None
             return self._begin_backout(now)
+
+        # Where the walls say it's pointing beats where the encoders think it is: pull
+        # the heading estimate towards it on every fresh frame.
+        if self.grid:
+            yaw, stamp = self._wall_yaw()
+            if yaw is not None and stamp != self._yaw_stamp:
+                self._yaw_stamp = stamp
+                o.theta = wrap(o.theta + CAMERA_YAW_NUDGE * wrap(self.heading + yaw - o.theta))
 
         # Off the centreline to the right -> aim a little left of the corridor, and
         # vice versa. The pose already carries what the side walls say.
@@ -1326,7 +1408,8 @@ class Nav:
                              gate_maybe=GATE_MAYBE_M)
         self.odo.reset(*self.map.centre(self.base_cell), HEADING_RAD[start])
         self._loc_stamps = {}
-        self.mover = Mover(drive, self.sonar, self.odo, camera_view=self._camera_view)
+        self.mover = Mover(drive, self.sonar, self.odo,
+                           camera_view=self._camera_view if wall_camera is not None else None)
         self.cell = self.base_cell   # cell it's in (or leaving, mid-move)
         self.facing = start          # cardinal heading when last on the grid
         self.move_heading = None     # heading of the move in progress

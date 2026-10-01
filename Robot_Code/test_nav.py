@@ -637,7 +637,8 @@ import types
 
 def view(**kw):
     base = dict(t=time.monotonic(), front_close=False, front_m=None, left_m=None,
-                right_m=None, left_slope=None, right_slope=None, columns=0)
+                right_m=None, left_slope=None, right_slope=None, columns=0,
+                yaw_rad=None, yaw_src=None)
     base.update(kw)
     v = types.SimpleNamespace(**base)
     v.age = lambda now=None: time.monotonic() - v.t
@@ -717,6 +718,89 @@ check("neither has anything -> None (falls back to the filtered pose)",
       offset(None, None, view()) is None)
 check("no camera at all -> sonar offset unchanged",
       abs(offset(side + 0.02, side - 0.02, None) - 0.02) < 1e-9)
+
+print("20) squaring up to the walls after a turn")
+import math
+
+
+class LogDrive(FakeDrive):
+    """Remembers every set_velocity, since stop() wipes .last."""
+    def __init__(self):
+        super().__init__(); self.log = []
+    def set_velocity(self, v, w):
+        super().set_velocity(v, w); self.log.append((v, w))
+
+
+def mover_nav(yaw=None, t=None):
+    d = LogDrive()
+    n = M.Nav(d, FakeVision([None] * 5), FakeLeds(), _Open(), wall_camera=object())
+    n.cam_walls = view(yaw_rad=yaw, yaw_src="walls" if yaw is not None else None,
+                       **({} if t is None else {"t": t}))
+    return n, d
+
+
+EAST = M.HEADING_RAD[1]
+n, d = mover_nav()
+n.odo.theta = M.HEADING_RAD[0]
+n.mover.move_to(0.42, 0.14, EAST)
+check("starts with a turn on the spot", n.mover.phase == M.Mover.TURN)
+n.odo.theta = EAST + 0.01                       # the turn lands close enough
+n.mover.update()
+check("...then squares up before driving off", n.mover.phase == M.Mover.ALIGN)
+
+n, d = mover_nav(yaw=0.10)
+n.odo.theta = EAST
+n.mover._begin_align(time.monotonic())
+n.mover.align_ready = 0.0
+n.mover._align()
+check("turned 5.7 deg LEFT of the walls -> pulses a turn to the RIGHT",
+      d.log and d.log[-1][0] == 0.0 and d.log[-1][1] < 0)
+check("...and stops again afterwards", d.last == (0.0, 0.0))
+check("still squaring up (not off driving)", n.mover.phase == M.Mover.ALIGN)
+
+n, d = mover_nav(yaw=-0.10)
+n.mover._begin_align(time.monotonic()); n.mover.align_ready = 0.0
+n.mover._align()
+check("turned RIGHT of the walls -> pulses LEFT", d.log and d.log[-1][1] > 0)
+
+n, d = mover_nav(yaw=0.10, t=time.monotonic())
+n.mover.move_to(0.42, 0.14, EAST)
+n.mover._begin_align(time.monotonic())          # frame taken BEFORE it stopped moving
+n.mover._align()
+check("a frame from before it settled is not acted on", d.log == [])
+
+n, d = mover_nav(yaw=0.005)
+n.odo.theta = EAST + 0.2                         # encoders say 11 deg out; walls say square
+n.mover.move_to(0.42, 0.14, EAST)
+n.mover._begin_align(time.monotonic()); n.mover.align_ready = 0.0
+n.mover._align()
+check("square -> drives off", n.mover.phase == M.Mover.DRIVE)
+check("...and the heading estimate is snapped to the walls, not the encoders",
+      abs(n.odo.theta - (EAST + 0.005)) < 1e-9)
+
+n, d = mover_nav()                               # nothing in view to square up to
+n.mover.move_to(0.42, 0.14, EAST)
+n.mover._begin_align(time.monotonic() - 1.0)
+n.mover._align()
+check("no wall angle available -> doesn't hang, drives on", n.mover.phase == M.Mover.DRIVE)
+
+n, d = mover_nav(yaw=0.0)
+n.odo.theta = EAST + 0.01
+n.mover.move_to(0.42, 0.14, EAST)
+n.odo.theta = EAST + 0.10                        # drifted 5.7 deg by the encoders' count
+n.mover.update()
+want = EAST + 0.10 * (1 - M.CAMERA_YAW_NUDGE)
+check("driving: heading estimate pulled towards what the walls say",
+      abs(n.odo.theta - want) < 1e-6)
+n.mover.update()
+check("...once per fresh frame, not once per tick", abs(n.odo.theta - want) < 1e-3)
+
+n = M.Nav(LogDrive(), FakeVision([None]), FakeLeds(), _Open())    # no wall camera
+n.odo.theta = M.HEADING_RAD[0]
+n.mover.move_to(0.42, 0.14, EAST)
+n.odo.theta = EAST + 0.01
+n.mover.update()
+check("no camera -> no squaring-up phase, straight to driving", n.mover.phase == M.Mover.DRIVE)
 
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)

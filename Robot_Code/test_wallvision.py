@@ -122,6 +122,23 @@ if v.left_slope is not None and v.right_slope is not None:
           v.left_slope < -0.08 and v.right_slope > 0.08,
           f"slopes {v.left_slope:.2f}, {v.right_slope:.2f} (tan10 = 0.18)")
 
+print("3b) yaw against the walls, +ve = turned left")
+for deg in (-12, -5, 0, 5, 10):
+    v, _ = view_from(CELL / 2, deg, corridor(3))
+    check(f"{deg:+d} deg off -> yaw {deg:+d} deg (side walls)",
+          v.yaw_rad is not None and abs(math.degrees(v.yaw_rad) - deg) <= 1.5,
+          f"got {None if v.yaw_rad is None else round(math.degrees(v.yaw_rad), 2)} via {v.yaw_src}")
+v, _ = view_from(CELL / 2, 7, corridor(3, left=False, right=False))
+check("no side walls, front wall only: yaw from its line",
+      v.yaw_src == "front" and abs(math.degrees(v.yaw_rad) - 7) <= 2.0,
+      f"got {None if v.yaw_rad is None else round(math.degrees(v.yaw_rad), 2)} via {v.yaw_src}")
+v, _ = view_from(CELL / 2, -9, corridor(3, left=False))
+check("one side wall only: yaw from that wall",
+      v.yaw_src == "wall" and abs(math.degrees(v.yaw_rad) + 9) <= 1.5,
+      f"got {None if v.yaw_rad is None else round(math.degrees(v.yaw_rad), 2)} via {v.yaw_src}")
+v, _ = view_from(CELL / 2, 0, [])
+check("nothing in view -> no yaw", v.yaw_rad is None)
+
 print("4) wall right in front (the cell's own front wall): too close to range")
 v, _ = view_from(CELL / 2, 0, corridor(1), y=CELL / 2)
 check("front_close", v.front_close, f"front_m {v.front_m}")
@@ -165,6 +182,68 @@ else:
     check("far wall found 60-110 cm away", v.front_m is not None and 0.6 <= v.front_m <= 1.1,
           f"got {v.front_m}")
     check("not mistaken for a wall right in front", not v.front_close)
+
+print("8c) closed loop: Mover squares up against the rendered camera, with turn slip")
+import types
+import main as M
+
+
+class _Clock:
+    """Fake time. sleep() also lets the (fake) tracks turn the robot while it runs."""
+    def __init__(self):
+        self.t = 1000.0
+        self.w = 0.0                 # commanded yaw rate, rad/s (+ = left)
+        self.yaw = 0.0               # TRUE yaw against the walls
+        self.slip = 0.6              # the chassis really turns 60% of what's commanded
+    def monotonic(self): return self.t
+    def sleep(self, s): self.advance(s)
+    def advance(self, dt):
+        self.yaw += self.w * dt * self.slip
+        self.t += dt
+
+
+def _closed_loop(start_deg, slip=0.6):
+    clock = _Clock()
+    clock.yaw, clock.slip = math.radians(start_deg), slip
+    real_time = M.time
+    M.time = types.SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep)
+
+    class Drive:
+        def set_velocity(self, v, w): clock.w = w
+        def stop(self): clock.w = 0.0
+        def read_encoders(self): return None
+    walls = corridor(3)
+    wc = WallCamera(CAM_H, CAM_TILT, HFOV, VFOV)
+    n = M.Nav(Drive(), types.SimpleNamespace(look=lambda: None, last_frame=None,
+                                             geometry_ok=False),
+              types.SimpleNamespace(green=lambda o: 0, yellow=lambda o: 0, red=lambda o: 0,
+                                    all_off=lambda: 0), M.Ultrasonics(enabled=False),
+              wall_camera=wc)
+    try:
+        n.odo.theta = M.HEADING_RAD[0] + math.radians(start_deg) * 0.4   # encoders only half-know
+        n.mover.move_to(0.14, 0.14 + 0.28, M.HEADING_RAD[0])
+        n.mover.phase = M.Mover.IDLE
+        n.mover._begin_align(clock.monotonic())
+        ticks = 0
+        while n.mover.phase == M.Mover.ALIGN and ticks < 60:
+            th = math.pi / 2 + clock.yaw
+            cam = (0.14 + CAM_FORWARD * math.cos(th), 0.14 + CAM_FORWARD * math.sin(th))
+            v = wc.look(render(cam, th, walls))
+            v.t = clock.t
+            v.age = lambda now=None: clock.t - v.t
+            n.cam_walls = v
+            n.mover.update()
+            clock.advance(0.05)
+            ticks += 1
+        return math.degrees(clock.yaw), clock.t - 1000.0, n.mover.phase
+    finally:
+        M.time = real_time
+
+
+for start in (15, -15, 6):
+    yaw, took, phase = _closed_loop(start)
+    check(f"starts {start:+d} deg off -> ends {yaw:+.1f} deg, {took:.2f}s, then drives",
+          abs(yaw) <= 2.0 and phase == M.Mover.DRIVE and took < 1.5)
 
 print("9) speed")
 import time
