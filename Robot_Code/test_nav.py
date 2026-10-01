@@ -93,7 +93,7 @@ check("starts in the base cell, facing north", n.cell == M.BASE_CELL and n.facin
 check("base cell mapped before moving", M.BASE_CELL in n.map.visited)
 check("open ahead is recorded as open", n.map.wall(M.BASE_CELL, 0) is False)
 check("driving forward at SEARCH_SPEED", d.last[0] == M.SEARCH_SPEED)
-check("dead straight with no encoder error", d.last[1] == 0.0)
+check("dead straight with no encoder error", abs(d.last[1]) < 1e-9)
 check("yellow on, green and red off", l.y is True and l.g is False and l.r is False)
 
 print("1a) the encoders hold it straight -- neither track falls behind")
@@ -114,7 +114,7 @@ check("still driving forward while correcting", d.last[0] > 0)
 print("1b) no encoders -> still drives, open loop, rather than crashing")
 d = FakeDrive(ticks=None)
 run(M.Nav(d, FakeVision([None] * 3), FakeLeds(), FakeSonar(front=1.0)), 3)
-check("still drives forward", d.last == (M.SEARCH_SPEED, 0.0))
+check("still drives forward", d.last[0] == M.SEARCH_SPEED and abs(d.last[1]) < 1e-9)
 
 print("1c) a wall ahead: turns on the spot to an open side")
 d = FakeDrive(ticks=(0, 0))
@@ -630,6 +630,93 @@ try:
     check("dim low-texture frame still yields a victim", isinstance(_r2, M.Victim))
 except (ImportError, NameError) as _e:
     print(f"  SKIP  needs numpy + opencv ({_e})")
+
+print("19) the camera as a second wall sensor")
+import types
+
+
+def view(**kw):
+    base = dict(t=time.monotonic(), front_close=False, front_m=None, left_m=None,
+                right_m=None, left_slope=None, right_slope=None, columns=0)
+    base.update(kw)
+    v = types.SimpleNamespace(**base)
+    v.age = lambda now=None: time.monotonic() - v.t
+    return v
+
+
+class _Open(FakeSonar):
+    """Sonars that see open space on all three sides (no echo)."""
+    def __init__(self):
+        super().__init__(front=None)
+        self.sensors = {"front": 1, "left": 1, "right": 1}
+    def get(self, name): return None
+
+
+def cam_nav(v):
+    n = M.Nav(FakeDrive(), FakeVision([None] * 5), FakeLeds(), _Open(),
+              wall_camera=object())
+    n.cam_walls = v
+    return n
+
+
+n = cam_nav(view(front_close=True))
+n.sense_from = {k: 0.0 for k in ("front", "left", "right")}
+n._record_walls(["front", "left", "right"])
+check("sonar sees no front wall, camera sees one close -> marked", n.map.wall(n.cell, 0) is True)
+check("...but nothing is invented on the open east side", n.map.wall(n.cell, 1) is False)
+
+n = cam_nav(view(left_m=0.15, right_m=0.14))
+n.sense_from = {k: 0.0 for k in ("front", "left", "right")}
+n._record_walls(["front", "left", "right"])
+check("camera side walls at ~half a cell -> both marked",
+      n.map.wall(n.cell, 3) is True and n.map.wall(n.cell, 1) is True)
+
+n = cam_nav(view(right_m=0.43))
+n.sense_from = {k: 0.0 for k in ("front", "left", "right")}
+n._record_walls(["front", "left", "right"])
+check("a wall a whole cell further off is the next cell's, not this one's",
+      n.map.wall(n.cell, 1) is False)
+
+n = cam_nav(view(t=time.monotonic() - 5.0, front_close=True))
+check("a stale view is ignored", n._camera_view() is None)
+
+n = cam_nav(view(front_close=True))
+n.victim_cell = n.map.neighbour(n.cell, 0)
+n.sense_from = {k: 0.0 for k in ("front", "left", "right")}
+n._record_walls(["front", "left", "right"])
+check("never seals off the cell a victim is in", n.map.wall(n.cell, 0) is False)
+
+# centring blend
+class _Sides(FakeSonar):
+    def __init__(self, l, r):
+        super().__init__(front=1.0); self.l, self.r = l, r
+        self.sensors = {"front": 1, "left": 1, "right": 1}
+    def get(self, name): return {"front": 1.0, "left": self.l, "right": self.r}[name]
+    def stamp(self, name): return time.monotonic()
+
+
+def offset(sonar_l, sonar_r, cam):
+    n = M.Nav(FakeDrive(), FakeVision([None]), FakeLeds(), _Sides(sonar_l, sonar_r),
+              wall_camera=object())
+    n.cam_walls = cam
+    return n.mover._blended_offset()
+
+
+half, side = M.CELL_M / 2, M.SIDE_WALL_AT_CENTRE_M
+check("sonar and camera agree 2 cm right -> blended 2 cm",
+      abs(offset(side + 0.02, side - 0.02, view(left_m=half + 0.02, right_m=half - 0.02))
+          - 0.02) < 1e-9)
+check("they disagree by more than CAMERA_AGREE_M -> the sonars win",
+      abs(offset(side + 0.02, side - 0.02, view(left_m=half - 0.04, right_m=half + 0.04))
+          - 0.02) < 1e-9)
+check("sonars blind (no echo) -> the camera's offset is used",
+      abs(offset(None, None, view(left_m=half + 0.03, right_m=half - 0.03)) - 0.03) < 1e-9)
+check("camera sees only the right wall -> offset from that wall alone",
+      abs(offset(None, None, view(right_m=half - 0.025)) - 0.025) < 1e-9)
+check("neither has anything -> None (falls back to the filtered pose)",
+      offset(None, None, view()) is None)
+check("no camera at all -> sonar offset unchanged",
+      abs(offset(side + 0.02, side - 0.02, None) - 0.02) < 1e-9)
 
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)

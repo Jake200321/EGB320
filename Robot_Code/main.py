@@ -14,6 +14,7 @@ the walls, and holds heading from the encoders so neither track falls behind.
 
     python3 main.py                      # full run: camera window + map window
     python3 main.py --no-camera          # explore and map only, no vision at all
+    python3 main.py --no-camera-walls    # camera for victims only; walls from sonars alone
     python3 main.py --base-cell 6,6 --start-heading W   # base in another corner
     python3 main.py --calibrate straight # measure TICKS_PER_M
     python3 main.py --calibrate turn     # measure EFFECTIVE_TRACK_M
@@ -194,6 +195,20 @@ MAX_CENTRE_ANGLE = 0.30     # rad, ~17 deg
 # ignored (the filter's estimate is used instead).
 SIDE_FRESH_S = 0.35
 
+# --- the camera as a second wall sensor (wallvision.py) ------------------------
+# The camera sees both walls and the way ahead in one frame, 20 times a second, and
+# catches what the sonars miss (a soft or glancing wall that gives no echo). The
+# sonars cover what it can't (the last ~27 cm). They are used together:
+#   * centring: sonar and camera offsets are blended while they agree, and either
+#     one alone is used when the other has nothing;
+#   * mapping: a wall seen by EITHER marks the edge (a missed wall costs a collision,
+#     a phantom one only a detour), except towards a cell a victim is in.
+USE_CAMERA_WALLS = True
+CAMERA_WALL_WEIGHT = 0.5    # camera's share of the centring offset when both agree
+CAMERA_AGREE_M = 0.03       # ...agree = within this; further apart, trust the sonars
+CAMERA_FRESH_S = 0.30       # a wall view older than this is ignored
+CAMERA_WALL_TOLERANCE_M = 0.04  # camera wall is "this cell's" within half a cell + this
+
 # --- localisation: odometry corrected by the sonars against the map ------------
 # Each sonar reading is compared with the range the map predicts from where the
 # robot thinks it is, and the difference corrects position AND heading. These say
@@ -360,6 +375,15 @@ def status_text(nav, sonar, leds, hz):
         d = sonar.get(name)
         return "  ---" if d is None else f"{d*100:5.1f}"
     sonar_txt = f"sonar L{cm('left')} F{cm('front')} R{cm('right')} cm"
+    if getattr(nav, "wallcam", None) is not None:
+        view = nav._camera_view()
+        if view is None:
+            sonar_txt += " cam ---"
+        else:
+            def cv(x):
+                return " --" if x is None else f"{x*100:3.0f}"
+            front = "CLS" if view.front_close else cv(view.front_m)
+            sonar_txt += f" cam L{cv(view.left_m)} F{front} R{cv(view.right_m)}"
 
     lit = "".join(c if getattr(leds, "_state", {}).get(n) else "-"
                   for n, c in (("green", "G"), ("yellow", "Y"), ("red", "R")))
@@ -779,8 +803,9 @@ class Mover:
 
     IDLE, TURN, DRIVE, BACKOUT = "IDLE", "TURN", "DRIVE", "BACKOUT"
 
-    def __init__(self, drive, sonar, odo):
+    def __init__(self, drive, sonar, odo, camera_view=None):
         self.drive, self.sonar, self.odo = drive, sonar, odo
+        self.camera_view = camera_view      # () -> fresh wallvision.WallView or None
         self.phase = self.IDLE
         self.lateral = None                         # m right of centre, for the HUD
         self.near_since = None
@@ -890,7 +915,7 @@ class Mover:
 
         # Off the centreline to the right -> aim a little left of the corridor, and
         # vice versa. The pose already carries what the side walls say.
-        self.lateral = self._side_offset()
+        self.lateral = self._blended_offset()
         if self.lateral is None:
             self.lateral = (o.x - tx) * rx + (o.y - ty) * ry
         aim = self.heading + _clamp(CENTRE_GAIN * self.lateral, MAX_CENTRE_ANGLE)
@@ -900,6 +925,34 @@ class Mover:
             v = -ARRIVE_SPEED                    # target is behind: back straight up
         self.drive.set_velocity(v, w)
         return None
+
+    def _camera_offset(self):
+        """Metres right of centre from the camera's wall view, or None. Walls sit on
+        the cell boundaries, so a wall at the centre is half a cell away."""
+        view = self.camera_view() if self.camera_view else None
+        if view is None:
+            return None
+        half = CELL_M / 2.0
+        if view.left_m is not None and view.right_m is not None:
+            return (view.left_m - view.right_m) / 2.0
+        if view.right_m is not None:
+            return half - view.right_m
+        if view.left_m is not None:
+            return view.left_m - half
+        return None
+
+    def _blended_offset(self):
+        """Sonar and camera offsets together: blended while they agree, the sonars
+        alone when they don't (they're the better-proven of the two), and whichever
+        one has anything when only one does."""
+        sonar, cam = self._side_offset(), self._camera_offset()
+        if cam is None:
+            return sonar
+        if sonar is None:
+            return cam
+        if abs(sonar - cam) <= CAMERA_AGREE_M:
+            return CAMERA_WALL_WEIGHT * cam + (1.0 - CAMERA_WALL_WEIGHT) * sonar
+        return sonar
 
     def _side_offset(self):
         """Metres right of the corridor centre read straight off the side sonars, or
@@ -1247,8 +1300,11 @@ class Nav:
     """
 
     def __init__(self, drive, vision, leds, sonar=None, base_cell=None,
-                 start_heading=None):
+                 start_heading=None, wall_camera=None):
         self.drive, self.vision, self.leds = drive, vision, leds
+        self.wallcam = wall_camera       # wallvision.WallCamera, or None for sonar only
+        self.cam_walls = None            # latest wallvision.WallView
+        self._wall_frame = None          # the frame it was computed from
         self.sonar = sonar if sonar is not None else Ultrasonics(enabled=False)
         self.state = SEARCH
         self.hits = 0            # consecutive frames with a victim
@@ -1270,7 +1326,7 @@ class Nav:
                              gate_maybe=GATE_MAYBE_M)
         self.odo.reset(*self.map.centre(self.base_cell), HEADING_RAD[start])
         self._loc_stamps = {}
-        self.mover = Mover(drive, self.sonar, self.odo)
+        self.mover = Mover(drive, self.sonar, self.odo, camera_view=self._camera_view)
         self.cell = self.base_cell   # cell it's in (or leaving, mid-move)
         self.facing = start          # cardinal heading when last on the grid
         self.move_heading = None     # heading of the move in progress
@@ -1433,6 +1489,7 @@ class Nav:
             self._finish(f"mission time up ({MISSION_TIME_S:.0f}s)")
 
         seen = self.vision.look()
+        self._look_at_walls()
 
         # Debounce both ways: a single frame should neither trigger an approach
         # nor abandon one. Cheap insurance against detector flicker.
@@ -1466,6 +1523,41 @@ class Nav:
             self._at_base()
         elif self.state == DONE:
             self._done()
+
+    def _look_at_walls(self):
+        """Run the wall detector on the frame vision just grabbed (once per frame)."""
+        if self.wallcam is None:
+            return
+        frame = getattr(self.vision, "last_frame", None)
+        if frame is None or frame is self._wall_frame:
+            return
+        self._wall_frame = frame
+        try:
+            self.cam_walls = self.wallcam.look(frame)
+        except Exception as exc:                       # noqa: BLE001
+            STATUS.event(f"[walls] camera wall detection failed, sonar only -- "
+                         f"{type(exc).__name__}: {exc}")
+            self.wallcam = self.cam_walls = None
+
+    def _camera_view(self):
+        """The latest wall view if it's recent enough to act on."""
+        view = self.cam_walls
+        if view is None or view.age() > CAMERA_FRESH_S:
+            return None
+        return view
+
+    def _camera_sees_wall(self, name):
+        """Does the camera see a wall on this side of the cell? None if it can't say.
+        Only ever vouches FOR a wall -- not seeing one proves nothing."""
+        view = self._camera_view()
+        if view is None:
+            return None
+        reach = CELL_M / 2.0 + CAMERA_WALL_TOLERANCE_M
+        if name == "front":
+            return bool(view.front_close or (view.front_m is not None
+                                            and view.front_m - CAMERA_FORWARD_M <= reach))
+        dist = view.left_m if name == "left" else view.right_m
+        return dist is not None and dist <= reach
 
     def _wanted(self, v):
         """Is this a victim still to be rescued?
@@ -1617,7 +1709,14 @@ class Nav:
                 # Towards the victim, a reading that's short but not wall-short is the
                 # victim standing just beyond the boundary -- don't seal it off.
                 window = VICTIM_WALL_WINDOW_M
-            self.map.set_wall(self.cell, heading, d is not None and d < at_centre + window)
+            present = d is not None and d < at_centre + window
+            if (not present and self._camera_sees_wall(name)
+                    and self.map.neighbour(self.cell, heading) != self.victim_cell):
+                shown = "no echo" if d is None else f"{d*100:.0f}cm"
+                STATUS.event(f"[walls] {self.cell} {name}: sonar says open ({shown}), "
+                             "camera sees a wall -- marking it")
+                present = True
+            self.map.set_wall(self.cell, heading, present)
         self.map.visited.add(self.cell)
 
     def _arrived(self):
@@ -1952,6 +2051,8 @@ def main():
     ap.add_argument("--no-camera", action="store_true",
                     help="no vision at all -- explore and map the maze only")
     ap.add_argument("--no-map", action="store_true", help="don't open the map window")
+    ap.add_argument("--no-camera-walls", action="store_true",
+                    help="don't use the camera to see walls -- sonars only")
     ap.add_argument("--base-cell", default=None,
                     help=f"base cell as col,row (default {BASE_CELL[0]},{BASE_CELL[1]})")
     ap.add_argument("--start-heading", choices=["N", "E", "S", "W"], default=None,
@@ -2009,8 +2110,12 @@ def main():
             _vs.BLUR_VARIANCE_THRESHOLD = blur
         vision = VictimVision(use_placeholder=args.placeholder_vision)
         vision.blur_threshold = blur
+    wallcam = None
+    if (USE_CAMERA_WALLS and not args.no_camera and not args.no_camera_walls
+            and not args.placeholder_vision):
+        wallcam = make_wall_camera()
     nav = Nav(drive, vision, leds, sonar, base_cell=base_cell,
-              start_heading=args.start_heading)
+              start_heading=args.start_heading, wall_camera=wallcam)
     display = Display(enabled=not args.no_display, camera=not args.no_camera,
                       show_map=not args.no_map)
     STATUS.event(f"[nav] {MAZE_COLS}x{MAZE_ROWS} maze of {CELL_M*1000:.0f}mm cells, "
@@ -2067,6 +2172,24 @@ def main():
         display.close()
         save_map(nav)
         print("stopped")
+
+
+def make_wall_camera():
+    """The camera wall detector, or None if it can't be set up (no numpy/OpenCV, or
+    the camera geometry isn't measured) -- the robot then runs on the sonars alone."""
+    try:
+        from camera_capture_v2_0 import (CAMERA_HEIGHT_M, CAMERA_TILT_DEG,
+                                         HORIZONTAL_FOV_DEG, VERTICAL_FOV_DEG)
+        from wallvision import WallCamera
+    except Exception as exc:                           # noqa: BLE001
+        STATUS.event(f"[walls] camera walls off -- {type(exc).__name__}: {exc}")
+        return None
+    if None in (CAMERA_HEIGHT_M, CAMERA_TILT_DEG, HORIZONTAL_FOV_DEG, VERTICAL_FOV_DEG):
+        STATUS.event("[walls] camera walls off -- camera geometry not set in "
+                     "camera_capture_v2_0.py")
+        return None
+    STATUS.event("[walls] camera + sonar wall sensing")
+    return WallCamera(CAMERA_HEIGHT_M, CAMERA_TILT_DEG, HORIZONTAL_FOV_DEG, VERTICAL_FOV_DEG)
 
 
 def save_map(nav):
