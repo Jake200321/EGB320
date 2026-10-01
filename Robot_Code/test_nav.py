@@ -17,6 +17,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import main as M
 import motors as MOT
 
+# Most of this file exercises the legacy path: differential steering while driving and no
+# pivot trim at the start of a leg. The shipped defaults are the other way round (the real
+# chassis can't steer by a speed difference -- see STEER_WHILE_DRIVING), and section 27
+# tests those. The defaults are saved here and restored there.
+_DEFAULT_STEER, _DEFAULT_TRIM = M.STEER_WHILE_DRIVING, M.TRIM_ENABLED
+M.STEER_WHILE_DRIVING, M.TRIM_ENABLED = True, False
+
 
 # --------------------------------------------------------------------- fakes
 class FakeDrive:
@@ -1113,6 +1120,103 @@ n.mover.update()
 check("with --no-centring it ignores the walls and holds heading", n.mover.lateral == 0.0)
 M.CENTRING = True
 check("camera walls are OFF by default", M.USE_CAMERA_WALLS is False)
+
+print("27) the shipped motion: no steering while driving, pivot pulses set the heading")
+M.STEER_WHILE_DRIVING, M.TRIM_ENABLED = _DEFAULT_STEER, _DEFAULT_TRIM
+check("defaults: no differential steering while driving", _DEFAULT_STEER is False)
+check("defaults: heading trim on", _DEFAULT_TRIM is True)
+
+
+class _Robot:
+    """A fake clock that turns the fake robot while a pivot is commanded.
+
+    `eff` is how much of the commanded turn really happens; pulses shorter than
+    `dead_s` do nothing (a motor dead band); `stuck` means it never turns at all."""
+    def __init__(self, nav, drive, eff=1.0, dead_s=0.0, stuck=False):
+        self.t, self.nav, self.drive = 1000.0, nav, drive
+        self.eff, self.dead_s, self.stuck = eff, dead_s, stuck
+    def monotonic(self): return self.t
+    def sleep(self, dt):
+        v, w = self.drive.last
+        if v == 0.0 and w != 0.0 and not self.stuck and dt >= self.dead_s:
+            self.nav.odo.theta = M.wrap(self.nav.odo.theta + w * dt * self.eff)
+        self.t += dt
+
+
+def trim_run(start_err_deg, **robot_kw):
+    d = LogDrive()
+    n = M.Nav(d, FakeVision([None]), FakeLeds(), _Open())
+    robot = _Robot(n, d, **robot_kw)
+    real_time = M.time
+    M.time = types.SimpleNamespace(monotonic=robot.monotonic, sleep=robot.sleep)
+    try:
+        n.odo.theta = M.HEADING_RAD[1] + math.radians(start_err_deg)
+        n.mover.grid = True
+        n.mover.heading, n.mover.target, n.mover.through = M.HEADING_RAD[1], (0.42, 0.14), False
+        n.mover._front_stamp = None
+        n.mover._begin_trim(robot.t)
+        ticks = 0
+        while n.mover.phase == M.Mover.TRIM and ticks < 80:
+            n.mover.update()
+            robot.sleep(0.05)
+            ticks += 1
+        return n, d, robot, ticks
+    finally:
+        M.time = real_time
+
+
+n, d, robot, ticks = trim_run(-8.0)           # pointing 8 deg RIGHT of where it should
+check("8 deg right of the heading: pivots LEFT", d.log and d.log[0][0] == 0.0 and d.log[0][1] > 0)
+check("...and ends within the tolerance, driving",
+      n.mover.phase == M.Mover.DRIVE
+      and abs(M.wrap(n.mover.aim - n.odo.theta)) <= M.TRIM_TOL_RAD)
+check(f"...in a handful of pulses ({n.mover.trim_pulses})", n.mover.trim_pulses <= 4)
+n, d, robot, ticks = trim_run(+8.0)
+check("8 deg left: pivots RIGHT and settles", d.log and d.log[0][1] < 0
+      and n.mover.phase == M.Mover.DRIVE)
+n, d, robot, ticks = trim_run(5.0, eff=0.4)   # the chassis only turns 40% of the command
+check("a robot that turns 40% of what's commanded still converges",
+      n.mover.phase == M.Mover.DRIVE and abs(M.wrap(n.mover.aim - n.odo.theta)) <= M.TRIM_TOL_RAD)
+check(f"...and learned roughly that (trim_eff {n.mover.trim_eff:.2f})", 0.2 < n.mover.trim_eff < 0.8)
+n, d, robot, ticks = trim_run(5.0, dead_s=0.04)   # pulses under 40 ms turn nothing
+check("pulses inside a dead band get longer until they bite",
+      n.mover.phase == M.Mover.DRIVE and abs(M.wrap(n.mover.aim - n.odo.theta)) <= M.TRIM_TOL_RAD)
+_ev = []
+_o = M.STATUS.event; M.STATUS.event = lambda m: _ev.append(m)
+n, d, robot, ticks = trim_run(8.0, stuck=True)    # nothing it does turns the robot
+check("a robot that never turns: gives up (not forever), says so, drives on",
+      n.mover.phase == M.Mover.DRIVE and any("trim gave up" in e for e in _ev)
+      and n.mover.trim_pulses <= M.TRIM_MAX_PULSES)
+M.STATUS.event = _o
+n, d, robot, ticks = trim_run(0.5)
+check("already within tolerance: no pulse at all", d.log == [] and n.mover.phase == M.Mover.DRIVE)
+
+# leaning towards the centre of the corridor
+_half = M.SIDE_WALL_AT_CENTRE_M
+n = M.Nav(LogDrive(), FakeVision([None]), FakeLeds(), _Sides(_half + 0.04, _half - 0.04))
+n.mover.grid, n.mover.heading = True, M.HEADING_RAD[1]
+n.mover._begin_trim(time.monotonic())
+check("4 cm right of centre -> aims left of the cardinal heading",
+      n.mover.aim - M.HEADING_RAD[1] > 0.1)
+check("...but never more than CENTRE_AIM_MAX_RAD", n.mover.aim - M.HEADING_RAD[1] <= M.CENTRE_AIM_MAX_RAD + 1e-9)
+n = M.Nav(LogDrive(), FakeVision([None]), FakeLeds(), _Sides(_half - 0.04, _half + 0.04))
+n.mover.grid, n.mover.heading = True, M.HEADING_RAD[1]
+n.mover._begin_trim(time.monotonic())
+check("4 cm left of centre -> aims right", n.mover.aim - M.HEADING_RAD[1] < -0.1)
+n = M.Nav(LogDrive(), FakeVision([None]), FakeLeds(), _Sides(_half + 0.005, _half - 0.005))
+n.mover.grid, n.mover.heading = True, M.HEADING_RAD[1]
+n.mover._begin_trim(time.monotonic())
+check("under 2 cm off: noise, not worth a pulse -> aims straight", n.mover.aim == M.HEADING_RAD[1])
+
+# and the leg itself sends no yaw
+d = LogDrive()
+n = M.Nav(d, FakeVision([None]), FakeLeds(), _Sides(_half, _half))      # centred, facing east
+n.odo.theta = M.HEADING_RAD[1]
+n.mover.move_to(0.70, n.odo.y, M.HEADING_RAD[1])
+n.mover.update()                                  # TRIM: already square -> straight to driving
+n.mover.update()                                  # DRIVE
+check("driving a leg commands forward speed and NO yaw (a speed difference can't steer it)",
+      n.mover.phase == M.Mover.DRIVE and d.log and d.log[-1][0] > 0 and d.log[-1][1] == 0.0)
 
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)

@@ -210,7 +210,8 @@ class _Clock:
 def _closed_loop(start_deg, slip=0.6, deadband=0.0):
     clock = _Clock()
     clock.yaw, clock.slip, clock.deadband = math.radians(start_deg), slip, deadband
-    real_time = M.time
+    real_time, real_trim = M.time, M.TRIM_ENABLED
+    M.TRIM_ENABLED = False           # these test the camera's ALIGN phase on its own
     M.time = types.SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep)
 
     class Drive:
@@ -242,7 +243,7 @@ def _closed_loop(start_deg, slip=0.6, deadband=0.0):
             ticks += 1
         return math.degrees(clock.yaw), clock.t - 1000.0, n.mover.phase, n.odo.theta
     finally:
-        M.time = real_time
+        M.time, M.TRIM_ENABLED = real_time, real_trim
 
 
 for start in (9, -9, 6):

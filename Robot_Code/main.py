@@ -189,6 +189,27 @@ ODO_MIN_SHARE = 0.4
 BLOCK_MARGIN_M = 0.05
 BLOCK_CONFIRM = 3
 
+# STEERING WHILE DRIVING DOES NOTHING on this robot. Measured (straight_test.py step 5):
+# with the right track commanded 70 raw above the left -- left at 45, barely moving by
+# itself -- both tracks still ran at the same ~0.10 m/s and the robot turned ~4 deg/s. The
+# chassis forces the tracks to one speed, so a speed difference while driving can't steer;
+# only a pivot (tracks counter-rotating) can. So: drive straight with no yaw command, and
+# set the heading with short pivot pulses at the start of every leg (TRIM below), with the
+# encoder heading as the feedback. Set True to bring the old differential steering back.
+STEER_WHILE_DRIVING = False
+TRIM_ENABLED = True         # False: no pivot trim at the start of a leg
+TRIM_TOL_RAD = 0.035        # ~2 deg: close enough to start the leg
+TRIM_PULSE_MIN_S = 0.02     # shortest / longest single pivot pulse
+TRIM_PULSE_MAX_S = 0.15
+TRIM_SETTLE_S = 0.06        # stand still this long after a pulse so the encoders catch up
+TRIM_MAX_S = 1.2            # never spend longer than this squaring the heading up
+TRIM_MAX_PULSES = 8
+# Lean the leg towards the corridor centre: aim this far off the cardinal heading,
+# atan(offset / lead), so it arrives on the centreline. Next leg squares it up again.
+CENTRE_AIM_LEAD_M = 0.28
+CENTRE_AIM_MIN_M = 0.02     # offsets smaller than this aren't worth a pulse (noise)
+CENTRE_AIM_MAX_RAD = 0.15   # ~8.6 deg: never lean further than this
+
 # Heading hold: the encoders say which way it's pointing, so holding heading is
 # the same thing as not letting either track fall behind the other.
 HEADING_HOLD_GAIN = 4.0     # rad/s per rad of heading error
@@ -860,11 +881,13 @@ class Mover:
       * backs out if something turns up in the way that the map said was open.
     """
 
-    IDLE, TURN, ALIGN, DRIVE, BACKOUT = "IDLE", "TURN", "ALIGN", "DRIVE", "BACKOUT"
+    IDLE, TURN, ALIGN, TRIM, DRIVE, BACKOUT = ("IDLE", "TURN", "ALIGN", "TRIM", "DRIVE",
+                                               "BACKOUT")
 
     def __init__(self, drive, sonar, odo, camera_view=None):
         self.drive, self.sonar, self.odo = drive, sonar, odo
         self.camera_view = camera_view      # () -> fresh wallvision.WallView or None
+        self.trim_eff = 1.0                 # learned: real turn per commanded turn, per pulse
         self.phase = self.IDLE
         self.lateral = None                         # m right of centre, for the HUD
         self.near_since = None
@@ -898,7 +921,64 @@ class Mover:
         if abs(wrap(heading - self.odo.theta)) > TURN_TOLERANCE_RAD:
             self.phase, self.turn_sign = self.TURN, None
         else:
+            self._begin_leg(now)
+
+    def _begin_leg(self, now):
+        """Start a leg: set the heading first (grid moves), then drive."""
+        if self.grid and TRIM_ENABLED:
+            self._begin_trim(now)
+        else:
             self._begin_drive(now)
+
+    def _begin_trim(self, now):
+        self.phase = self.TRIM
+        self.phase_started = now
+        self.trim_settle_until = now
+        self.trim_pulses = 0
+        self.trim_before = None                     # (error, commanded angle) of the last pulse
+        # Aim a little towards the corridor centre if it's off to one side.
+        lateral = self._blended_offset() if CENTRING else None
+        lean = 0.0
+        if lateral is not None and abs(lateral) >= CENTRE_AIM_MIN_M:
+            lean = _clamp(math.atan2(lateral, CENTRE_AIM_LEAD_M), CENTRE_AIM_MAX_RAD)
+        self.aim = wrap(self.heading + lean)
+
+    def _trim(self):
+        """Pivot in short pulses until the encoder heading is on the aim.
+
+        Each pulse is sized from how much turn a pulse has actually been giving (trim_eff,
+        learned from the encoders), then it stands still while the encoders settle, so the
+        next measurement is clean. A pulse is far finer than a control tick of pivoting
+        (~6 deg), which is why this isn't done tick by tick.
+        """
+        now = time.monotonic()
+        if now < self.trim_settle_until:
+            return None
+        err = wrap(self.aim - self.odo.theta)
+        if self.trim_before is not None:                   # what did the last pulse do?
+            before, commanded = self.trim_before
+            moved = (before - err) * math.copysign(1.0, before)
+            observed = moved / commanded if commanded > 1e-6 else 1.0
+            self.trim_eff = _clamp(0.5 * self.trim_eff + 0.5 * max(observed, 0.05), 3.0) \
+                if observed > 0.05 else max(0.05, 0.5 * self.trim_eff)
+        if abs(err) <= TRIM_TOL_RAD:
+            self._begin_drive(now)
+            return None
+        if self.trim_pulses >= TRIM_MAX_PULSES or now - self.phase_started > TRIM_MAX_S:
+            STATUS.event(f"[nav] heading trim gave up: {math.degrees(err):+.1f} deg still off "
+                         f"after {self.trim_pulses} pulses -- driving on")
+            self._begin_drive(now)
+            return None
+        rate = MIN_TURN_RATE_PIVOT
+        pulse = _clamp(abs(err) / (rate * max(self.trim_eff, 0.05)), TRIM_PULSE_MAX_S)
+        pulse = max(TRIM_PULSE_MIN_S, pulse)
+        self.drive.set_velocity(0.0, math.copysign(rate, err))
+        time.sleep(pulse)
+        self.drive.stop()
+        self.trim_before = (err, rate * pulse)
+        self.trim_pulses += 1
+        self.trim_settle_until = time.monotonic() + TRIM_SETTLE_S
+        return None
 
     def _begin_drive(self, now):
         self.phase = self.DRIVE
@@ -917,6 +997,8 @@ class Mover:
             return self._turn()
         if self.phase == self.ALIGN:
             return self._align()
+        if self.phase == self.TRIM:
+            return self._trim()
         if self.phase == self.DRIVE:
             return self._drive()
         if self.phase == self.BACKOUT:
@@ -940,7 +1022,7 @@ class Mover:
             if self.camera_view is not None and ALIGN_AFTER_TURN and self.grid:
                 self._begin_align(now)
             else:
-                self._begin_drive(now)
+                self._begin_leg(now)
             return None
         rate = min(SEARCH_TURN_RATE, max(MIN_TURN_RATE_PIVOT, TURN_GAIN * abs(err)))
         self.drive.set_velocity(0.0, math.copysign(rate, err))
@@ -985,13 +1067,13 @@ class Mover:
             if view is not None and view.t >= self.align_ready:
                 STATUS.event(f"[nav] squaring up lost the walls after {elapsed:.2f}s (last yaw "
                              f"{math.degrees(self.align_last or 0):+.1f} deg) -- driving on")
-                self._begin_drive(now)
+                self._begin_leg(now)
                 return None
         if yaw is None:
             if (not self.align_seen and elapsed > ALIGN_WAIT_S) or elapsed > ALIGN_MAX_S:
                 if not self.align_seen:
                     STATUS.event("[nav] turn done, but no wall angle in view -- not squared up")
-                self._begin_drive(now)
+                self._begin_leg(now)
             return None
         self.align_seen = True
         if self.align_first is None:
@@ -1000,7 +1082,7 @@ class Mover:
             self.odo.theta = wrap(self.heading + yaw)
             STATUS.event(f"[nav] squared up to the walls: {math.degrees(self.align_first):+.1f}"
                          f" -> {math.degrees(yaw):+.1f} deg off in {elapsed:.2f}s")
-            self._begin_drive(now)
+            self._begin_leg(now)
             return None
         # Did the last pulse help? Judge it by how the yaw moved.
         if self.align_last is not None:
@@ -1025,7 +1107,7 @@ class Mover:
             STATUS.event(f"[nav] squaring up gave up ({why}): {math.degrees(self.align_first):+.1f}"
                          f" -> {math.degrees(yaw):+.1f} deg after {elapsed:.2f}s -- driving on, "
                          "heading left as the encoders have it")
-            self._begin_drive(now)
+            self._begin_leg(now)
             return None
         # turned left (+) -> pulse right, and vice versa
         rate = MIN_TURN_RATE_PIVOT
@@ -1085,8 +1167,11 @@ class Mover:
         self.lateral = self._blended_offset() if CENTRING else 0.0
         if self.lateral is None:
             self.lateral = (o.x - tx) * rx + (o.y - ty) * ry
-        aim = self.heading + _clamp(CENTRE_GAIN * self.lateral, MAX_CENTRE_ANGLE)
-        w = _clamp(HEADING_HOLD_GAIN * wrap(aim - o.theta), MAX_STEER_RATE)
+        if STEER_WHILE_DRIVING or not self.grid:
+            aim = self.heading + _clamp(CENTRE_GAIN * self.lateral, MAX_CENTRE_ANGLE)
+            w = _clamp(HEADING_HOLD_GAIN * wrap(aim - o.theta), MAX_STEER_RATE)
+        else:
+            w = 0.0                  # a speed difference can't steer this chassis (see above)
         v = SEARCH_SPEED if remaining > ARRIVE_SLOW_M or self.through else ARRIVE_SPEED
         if remaining < 0:
             v = -ARRIVE_SPEED                    # target is behind: back straight up

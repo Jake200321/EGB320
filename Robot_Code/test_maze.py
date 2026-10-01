@@ -106,7 +106,7 @@ class World:
 
     def __init__(self, walls, victims, cell_m, base, start_heading,
                  turn_slip=1.0, left_weak=1.0, noise=0.004, seed=1, x_offset=0.0,
-                 turn_jitter=0.0):
+                 turn_jitter=0.0, locked_tracks=True):
         self.cell_m = cell_m
         self.segs = []
         size = COLS * cell_m
@@ -122,6 +122,10 @@ class World:
         self.turn_jitter = turn_jitter   # ...varying turn to turn by this fraction
         self._slip_now, self._pivoting = turn_slip, False
         self.left_weak = left_weak       # left track delivers this fraction
+        # The real chassis can't steer by a speed difference while driving: measured, both
+        # tracks run at the same speed whatever the commands (straight_test.py step 5).
+        # Only a pivot (tracks counter-rotating) turns it.
+        self.locked_tracks = locked_tracks
         self.ticks = [0.0, 0.0]
         self.rng = random.Random(seed)
         self.noise = noise
@@ -141,6 +145,8 @@ class World:
         half = M_TRACK / 2.0
         vl, vr = v - w * half, v + w * half
         vl *= self.left_weak                             # ...and what they deliver
+        if self.locked_tracks and abs(v) > 1e-9:
+            vl = vr = (vl + vr) / 2.0                    # driving: the chassis equalises them
         # Encoders count track travel, whatever the chassis actually does.
         self.ticks[0] += vl * dt * M.TICKS_PER_M
         self.ticks[1] += vr * dt * M.TICKS_PER_M
@@ -312,6 +318,9 @@ def run_mission(walls, victims, base=(0, 6), heading="N", seconds=M.MISSION_TIME
     leds = Leds()
     vision = SimVision(world) if camera else M.NullVision()
     nav = M.Nav(SimDrive(world), vision, leds, sonar, base_cell=base, start_heading=heading)
+    # A pulse of motion inside one control tick (the heading trim sleeps through them):
+    # move the robot and the clock for that long under whatever is commanded now.
+    M.time.sleep = lambda s: (world.advance(*nav.drive.last, s), setattr(clock, "t", clock.t + s))
 
     # Stand-in collection: the "mechanism" picks up whatever's at the robot's nose.
     real_at_victim = nav._at_victim
