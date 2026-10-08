@@ -1283,5 +1283,17 @@ n.mover.update()                                  # DRIVE
 check("driving a leg commands forward speed and NO yaw (a speed difference can't steer it)",
       n.mover.phase == M.Mover.DRIVE and d.log and d.log[-1][0] > 0 and d.log[-1][1] == 0.0)
 
+print("28) the blur guard setting can be renamed by the vision team without breaking nav")
+_old_vs = types.SimpleNamespace(BLUR_VARIANCE_THRESHOLD=100.0)
+_new_vs = types.SimpleNamespace(BLUR_RELATIVE_THRESHOLD=0.3)
+_none_vs = types.SimpleNamespace()
+check("finds the original name", M.blur_setting_name(_old_vs) == "BLUR_VARIANCE_THRESHOLD")
+check("finds the renamed one", M.blur_setting_name(_new_vs) == "BLUR_RELATIVE_THRESHOLD")
+check("copes with neither (returns None instead of raising)", M.blur_setting_name(_none_vs) is None)
+check("the old name wins if both exist (it's the one nav's default of 0 = off is defined for)",
+      M.blur_setting_name(types.SimpleNamespace(BLUR_VARIANCE_THRESHOLD=1.0,
+                                                BLUR_RELATIVE_THRESHOLD=0.3))
+      == "BLUR_VARIANCE_THRESHOLD")
+
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)

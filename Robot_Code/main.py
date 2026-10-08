@@ -1416,6 +1416,21 @@ class Victim:
 UNUSABLE = object()     # frame carried no usable information (blurred, or no frame)
 
 
+# The vision module's blur guard has been renamed by the vision team before, so look for
+# whichever name it has now rather than assuming one. The old one is an absolute Laplacian
+# variance (0 = off, which is what BLUR_THRESHOLD below sets); the newer one is relative
+# and nav doesn't know its scale, so that one is left alone unless --blur-threshold is given.
+BLUR_SETTING_NAMES = ("BLUR_VARIANCE_THRESHOLD", "BLUR_RELATIVE_THRESHOLD")
+
+
+def blur_setting_name(vs):
+    """The name of the blur guard setting in vision_system, or None if there isn't one."""
+    for name in BLUR_SETTING_NAMES:
+        if hasattr(vs, name):
+            return name
+    return None
+
+
 class VictimVision:
     """Kushal's VisionSystem, narrowed to the one thing nav needs: the victim object.
 
@@ -1471,7 +1486,8 @@ class VictimVision:
             os.chdir(cwd)
         self.draw_detections = type(self.system).draw_detections
         import vision_system_v2_0 as _vs
-        self.blur_threshold = _vs.BLUR_VARIANCE_THRESHOLD
+        name = blur_setting_name(_vs)
+        self.blur_threshold = getattr(_vs, name) if name else None
         print(f"[vision] VisionSystem, filtering for {VICTIM_CLASS_NAME!r}"
               f"{' on the floor' if VICTIM_ON_FLOOR else ''}")
 
@@ -2464,14 +2480,26 @@ def main():
         vision = NullVision()
         STATUS.event("[vision] --no-camera: exploring and mapping only")
     else:
+        blur_managed = False
         if not args.placeholder_vision:
             import vision_system_v2_0 as _vs
-            if _vs.BLUR_VARIANCE_THRESHOLD != blur:
-                STATUS.event(f"[vision] blur guard {_vs.BLUR_VARIANCE_THRESHOLD:g} -> "
-                             f"{blur:g}{' (off)' if blur <= 0 else ''}")
-            _vs.BLUR_VARIANCE_THRESHOLD = blur
+            blur_name = blur_setting_name(_vs)
+            if blur_name is None:
+                STATUS.event("[vision] no blur guard setting found in vision_system -- "
+                             "leaving the vision team's behaviour as it is")
+            elif blur_name == "BLUR_VARIANCE_THRESHOLD" or args.blur_threshold is not None:
+                old = getattr(_vs, blur_name)
+                if old != blur:
+                    STATUS.event(f"[vision] {blur_name} {old:g} -> "
+                                 f"{blur:g}{' (off)' if blur <= 0 else ''}")
+                setattr(_vs, blur_name, blur)
+                blur_managed = True
+            else:
+                STATUS.event(f"[vision] {blur_name} = {getattr(_vs, blur_name):g} (the vision "
+                             "team's value, left as is; --blur-threshold overrides it)")
         vision = VictimVision(use_placeholder=args.placeholder_vision)
-        vision.blur_threshold = blur
+        if blur_managed or args.placeholder_vision:
+            vision.blur_threshold = blur
     wallcam = None
     if ((USE_CAMERA_WALLS or args.camera_walls) and not args.no_camera
             and not args.no_camera_walls and not args.placeholder_vision):
