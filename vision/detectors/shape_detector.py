@@ -1,104 +1,102 @@
 """
 Shape Detector
 ====================================================================
-Version: v1 (first shape layer -- resolves the obstacle/door colour
-ambiguity using a hole + straight-edge check; other classes have no
-shape confirmation yet)
+Version: v2 (door/obstacle check rebuilt for the real door: a panel with a
+square cut out, outlined in RED TAPE -- the same red as the obstacle)
 
-Resolves the one colour ambiguity colour_detector.py can't: obstacle
-and door share a blue colour band, so a candidate comes back from the
-colour layer as candidate_classes = ["door", "obstacle"] and it's this
-module's job to pick one.
+Resolves the one colour ambiguity colour_detector.py can't: obstacle and
+door are both red, so a candidate comes back from the colour layer as
+candidate_classes = ["door", "obstacle"] and it's this module's job to
+pick one.
 
-The physical distinction (confirmed against the real arena, not guessed):
-  - door:     ONE continuous blue square frame with a real hole punched
-              through the middle -- straight, manufactured edges.
-  - obstacle: one jagged, irregular blue blob, no hole through it, no
-              long straight edges.
+What the camera actually sees in the red mask:
+  - door:     a THIN red upside-down U: two vertical tape strips joined by
+              a strip across the top, open at the bottom (the floor). Most
+              of the box is empty -- the opening shows carpet/background,
+              not red.
+  - obstacle: a SOLID red lump. The middle of its box is red.
 
-Both of those are checkable directly from the pixel mask:
-  1. HOLE CHECK -- cv2.findContours with RETR_CCOMP returns hierarchy, so
-     child contours (holes) nested inside the outer blob are visible
-     separately from the outer boundary. A door's mask has a hole; a solid
-     obstacle blob (usually) doesn't.
-  2. STRAIGHT-EDGE CHECK -- cv2.approxPolyDP simplifies a contour down to
-     its dominant corners. A manufactured square frame collapses to a
-     handful of vertices (~4, some slack for camera noise/perspective). A
-     jagged rubble/obstacle silhouette does NOT collapse cleanly -- it
-     keeps far more vertices even at the same simplification tolerance.
+So the question is simply "is the middle of this red shape empty?".
 
-Requiring BOTH (not just the hole) is what keeps this safe even though
-there's nothing else blue in the arena to confuse it with: the one
-realistic false trigger is the CLOSE step accidentally sealing off a small
-pocket inside an obstacle's own irregular outline, which would produce a
-"hole" but NOT a low, door-like vertex count -- so it still reads as
-obstacle.
+Why this replaces the old hole + corner-count check
+  The old check needed the red to form a CLOSED loop (so findContours
+  could see a hole inside it) and then needed the outline to simplify to
+  <= 8 corners. An upside-down U is open at the bottom, so it never has an
+  enclosed hole -- the old check could not return "door" for it at all,
+  and every door was called an obstacle.
+
+  This version never looks at contours. It COUNTS pixels, so it doesn't
+  matter whether the tape is open at the bottom or has a small gap from
+  glare:
+
+  1. FILL    = red pixels / area of the convex hull around them.
+               U-frame ~ 0.3-0.6 (mostly empty), solid lump ~ 0.8-1.0.
+  2. CENTRE  = fraction of the middle 40% x 40% of the box that is red.
+               U-frame ~ 0.0 (that is the opening), solid lump ~ 1.0.
+
+  Both must say "hollow" to call it a door. Needing both is the safety:
+  a jagged obstacle with a dent near the middle fails the FILL test, and
+  a stray gap that happens to land in the centre fails nothing on its own.
+
+Run standalone to read the live numbers (shown above every blue/red
+ambiguous box) and check the two thresholds against your REAL door and
+REAL obstacle:
+    python3 detectors/shape_detector.py
 """
 
 import cv2
 import numpy as np
 
 # ---------------- Constants ----------------
-# approxPolyDP's simplification tolerance, as a fraction of the contour's
-# own perimeter -- the standard way to scale this check regardless of the
-# object's size/distance from the camera.
-APPROX_EPSILON_RATIO = 0.02
+# Door if FILL is at or below this. A U of tape is mostly empty space.
+# If your real door reads higher than this (thick tape, small opening),
+# raise it -- but keep it below what your obstacle reads.
+DOOR_MAX_FILL = 0.75
 
-# A door's square frame should collapse to about 4 vertices. This ceiling
-# gives slack for camera noise, a slightly rounded manufactured corner, or
-# a bit of perspective skew -- an obstacle's jagged outline will still
-# blow well past this even with the same tolerance.
-STRAIGHT_EDGE_MAX_VERTICES = 8
+# The middle window of the candidate's box, as fractions of its width and
+# height. 0.30..0.70 = the central 40% on each axis. It must sit INSIDE the
+# door's opening, so don't widen it past about 0.25..0.75.
+CENTRE_WINDOW = (0.30, 0.70)
 
-# A "hole" has to be a real fraction of the outer blob's area to count as
-# a genuine opening, not a stray pixel-level gap left by thresholding
-# noise or a small pocket the CLOSE step accidentally sealed off.
-MIN_HOLE_AREA_RATIO = 0.08
+# Door if at most this fraction of the centre window is red.
+DOOR_MAX_CENTRE_FILL = 0.15
 # --------------------------------------------
 
 
-def _largest_outer_contour(mask):
-    """Returns (outer_contour, hole_contours) for the biggest top-level
-    (parent == -1) contour in the mask, using RETR_CCOMP so holes show up
-    as their own child contours instead of being invisible."""
-    contours, hierarchy = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours or hierarchy is None:
-        return None, []
+def door_metrics(mask):
+    """mask: the candidate's own uint8 0/255 pixel crop from ColourDetector
+    (candidate["mask"] -- NOT candidate["contour"], a convex hull, which has
+    already filled in any opening).
 
-    hierarchy = hierarchy[0]  # cv2 wraps it in an extra dimension
-    outer_indices = [i for i, h in enumerate(hierarchy) if h[3] == -1]
-    if not outer_indices:
-        return None, []
+    Returns (fill, centre_fill), or None if the mask is empty/degenerate."""
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return None
 
-    outer_idx = max(outer_indices, key=lambda i: cv2.contourArea(contours[i]))
-    holes = [contours[i] for i, h in enumerate(hierarchy) if h[3] == outer_idx]
-    return contours[outer_idx], holes
+    pts = np.column_stack([xs, ys]).astype(np.int32)
+    hull_area = cv2.contourArea(cv2.convexHull(pts))
+    if hull_area <= 0:
+        return None
+    fill = len(xs) / hull_area
+
+    x, y, w, h = cv2.boundingRect(pts)
+    lo, hi = CENTRE_WINDOW
+    centre = mask[y + int(h * lo): y + int(h * hi) + 1,
+                  x + int(w * lo): x + int(w * hi) + 1]
+    # a window with no pixels in it can't prove anything is hollow
+    centre_fill = cv2.countNonZero(centre) / centre.size if centre.size else 1.0
+
+    return fill, centre_fill
 
 
 def classify_obstacle_or_door(mask):
-    """mask: the candidate's own uint8 0/255 pixel crop, straight from
-    ColourDetector (candidate["mask"] -- NOT candidate["contour"], which is
-    a convex hull and has already had any hole filled in).
-
-    Returns "door", "obstacle", or None if the mask has nothing usable in
-    it (shouldn't normally happen -- the colour layer already filtered by
-    MIN_CONTOUR_AREA before handing this candidate over)."""
-    outer, holes = _largest_outer_contour(mask)
-    if outer is None:
+    """Returns "door", "obstacle", or None if the mask has nothing usable."""
+    metrics = door_metrics(mask)
+    if metrics is None:
         return None
 
-    outer_area = cv2.contourArea(outer)
-    if outer_area <= 0:
-        return "obstacle"
-
-    perimeter = cv2.arcLength(outer, True)
-    approx = cv2.approxPolyDP(outer, APPROX_EPSILON_RATIO * perimeter, True)
-    straight_edged = len(approx) <= STRAIGHT_EDGE_MAX_VERTICES
-
-    hole_area = max((cv2.contourArea(h) for h in holes), default=0.0)
-    has_real_hole = (hole_area / outer_area) >= MIN_HOLE_AREA_RATIO
-
-    if straight_edged and has_real_hole:
+    fill, centre_fill = metrics
+    if fill <= DOOR_MAX_FILL and centre_fill <= DOOR_MAX_CENTRE_FILL:
         return "door"
     return "obstacle"
 
@@ -125,25 +123,20 @@ def resolve_candidates(candidates):
 
 def run_live():
     """Standalone demo: colour layer -> shape layer -> draw the resolved
-    single-class boxes, so obstacle/door can be checked without the rest
-    of the pipeline in the way.
+    single-class boxes. For every door/obstacle candidate it also prints
+    the two measured numbers, so you can hold up the real door and the
+    real obstacle and see where each one lands relative to the thresholds.
 
     Run with:  python3 detectors/shape_detector.py
     (works from the vision folder or from inside detectors/, same as
     colour_detector.py)"""
     import os
     import sys
-    import cv2 as _cv2
 
     parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if parent_dir not in sys.path:
         sys.path.insert(0, parent_dir)
 
-    # Try the package-style import first (this is how vision_system_v2_0.py
-    # sees it -- detectors/ is a package, imported from the vision folder).
-    # Fall back to a plain sibling import for when THIS file is run
-    # directly as a script -- Python then only puts detectors/ itself on
-    # sys.path, where colour_detector.py sits right next to it.
     try:
         from detectors.colour_detector import ColourDetector
     except ImportError:
@@ -161,21 +154,25 @@ def run_live():
 
             candidates = detector.detect(frame)
             detections = resolve_candidates(candidates)
-            if detections:
-                print([d["class"] for d in detections])
 
-            for d in detections:
+            for cand, d in zip(candidates, detections):
                 x, y, w, h = d["bbox"]
-                _cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                _cv2.putText(frame, d["class"], (x, max(0, y - 8)),
-                             _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                label = d["class"]
+                if len(cand["candidate_classes"]) > 1:
+                    m = door_metrics(cand["mask"])
+                    if m is not None:
+                        label += f"  fill={m[0]:.2f} centre={m[1]:.2f}"
+                        print(label)
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.putText(frame, label, (x, max(0, y - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-            _cv2.imshow("Colour + Shape (obstacle/door resolved)", frame)
-            if _cv2.waitKey(1) & 0xFF == ord('q'):
+            cv2.imshow("Colour + Shape (obstacle/door resolved)", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
     finally:
         camera.release()
-        _cv2.destroyAllWindows()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

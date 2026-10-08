@@ -14,6 +14,12 @@ downstream (vision_system.py) has to know or care which camera is attached.
 Falls back to a normal USB webcam via cv2.VideoCapture if picamera2 isn't
 installed, so the vision pipeline can still be developed/tested on a laptop
 before being deployed to the Pi.
+
+--- Full field of view via full-resolution capture + software resize ---
+The camera captures at the sensor's full resolution (CAPTURE_SIZE) so the
+whole field of view is used, then read() shrinks each frame to FRAME_SIZE
+with cv2.resize before anything else touches it. Everything downstream
+still receives ordinary 640x480 BGR frames.
 """
 
 import cv2
@@ -26,7 +32,17 @@ except ImportError:
     PICAMERA_AVAILABLE = False
 
 # ---------------- Constants ----------------
+# What the REST of the project receives from read().
 FRAME_SIZE = (640, 480)
+
+# What the Pi camera actually captures. 2304 x 1296 is the Camera Module 3's
+# 2x2-binned mode: it still covers the FULL sensor (same field of view as
+# 4608 x 2592) but with a quarter of the pixels, so it runs far faster
+# (~50 fps possible vs ~14). libcamera picks this mode automatically when
+# asked for this size. read() resizes it down to FRAME_SIZE. (Only used for the Pi camera; the USB webcam path below
+# captures at FRAME_SIZE directly.)
+CAPTURE_SIZE = (2304, 1296)
+
 USB_CAMERA_INDEX = 0
 
 # Camera's HORIZONTAL field of view -- update this if the lens/camera ever
@@ -36,6 +52,11 @@ USB_CAMERA_INDEX = 0
 # Camera Module 3 standard lens is 66 x 41 deg (75 deg diagonal, per the Raspberry Pi
 # product brief). This was 45.0, which cannot be right next to a 41 deg vertical --
 # 45 x 41 is not a real 4:3 lens. Too small a value understates every bearing.
+#
+# NOTE: these 66 x 41 figures describe the FULL sensor view, which is what
+# full-resolution capture now gives you. Resizing to 4:3 squeezes the image
+# horizontally but the angle maths below still holds, because it works on
+# the position as a fraction of the frame width/height, not in raw pixels.
 HORIZONTAL_FOV_DEG = 66.0
 
 
@@ -159,9 +180,13 @@ MAX_ANALOGUE_GAIN = 8.0           # ceiling on how far gain compensates --
 
 # Frame duration limits (microseconds), min and max both set to the same
 # value below -- this is what actually pins the frame rate near a target,
-# rather than just requesting FRAME_SIZE and hoping the sensor picks a fast
+# rather than just requesting a size and hoping the sensor picks a fast
 # enough rate on its own.
-TARGET_FPS = 60
+#
+# The 2304x1296 mode can do roughly 50 fps, so 30 is comfortably reachable.
+# (The old full-resolution 4608x2592 mode topped out around 14.) Check the REAL rate with a timing loop
+# around read() (it includes the resize cost, which also takes time).
+TARGET_FPS = 30
 FRAME_DURATION_LIMIT_US = int(1_000_000 / TARGET_FPS)
 
 # IMPORTANT: changing exposure/gain changes overall brightness, which
@@ -177,12 +202,16 @@ class CameraCapture:
         # auto-detect unless explicitly told which camera to use
         self.use_picamera = PICAMERA_AVAILABLE if use_picamera is None else use_picamera
 
+        # Size of the frames read() hands back (640x480 by default)
+        self._out_size = frame_size
+
         if self.use_picamera:
             self._picam = Picamera2()
-            # requesting RGB888 explicitly -- picamera2's capture_array() then
-            # hands back an (H, W, 3) array in R, G, B channel order
+            # Capture at the sensor's FULL resolution (full field of view);
+            # read() resizes to self._out_size. RGB888 -> capture_array()
+            # gives an (H, W, 3) array in R, G, B channel order.
             config = self._picam.create_preview_configuration(
-                main={"format": "RGB888", "size": frame_size}
+                main={"format": "RGB888", "size": CAPTURE_SIZE}
             )
             self._picam.configure(config)
             self._picam.start()
@@ -220,7 +249,8 @@ class CameraCapture:
                 "AnalogueGain": analogue_gain,
                 "FrameDurationLimits": (FRAME_DURATION_LIMIT_US, FRAME_DURATION_LIMIT_US),
             })
-            print(f"[camera] using picamera2 -- PICAMERA_FRAME_ALREADY_BGR = {PICAMERA_FRAME_ALREADY_BGR}, "
+            print(f"[camera] using picamera2 -- capture {CAPTURE_SIZE} -> resize {self._out_size}, "
+                  f"PICAMERA_FRAME_ALREADY_BGR = {PICAMERA_FRAME_ALREADY_BGR}, "
                   f"exposure={exposure_time}us (was {settled_exposure}us), "
                   f"gain={analogue_gain:.2f} (was {settled['AnalogueGain']:.2f}), "
                   f"target {TARGET_FPS}fps -- re-run recalibrate_lighting.py after "
@@ -245,9 +275,15 @@ class CameraCapture:
                   "best-effort here, verify it actually took effect on your hardware")
 
     def read(self):
-        """Returns one frame in BGR order (what OpenCV expects), or None on failure."""
+        """Returns one frame in BGR order (what OpenCV expects), sized
+        self._out_size, or None on failure."""
         if self.use_picamera:
             frame = self._picam.capture_array()
+            # Shrink the full-resolution frame FIRST, so the colour
+            # conversion below runs on ~0.9 MB instead of ~36 MB.
+            # INTER_AREA averages blocks of pixels when shrinking, which
+            # keeps thin marker details cleaner than the default mode.
+            frame = cv2.resize(frame, self._out_size, interpolation=cv2.INTER_AREA)
             if PICAMERA_FRAME_ALREADY_BGR:
                 return frame  # already correct order -- converting again would swap it back to wrong
             return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)

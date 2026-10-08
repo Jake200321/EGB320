@@ -36,6 +36,8 @@ Run:
 """
 
 import cv2
+import numpy as np
+from collections import deque
 from detectors.colour_detector import ColourDetector
 from detectors.shape_detector import resolve_candidates
 from detectors.marker_detector import MarkerDetector
@@ -58,19 +60,34 @@ SHAPE_RESOLVED_CONFIDENCE = 0.7
 # are treated as "the same object" -- keep only the higher-confidence one.
 OVERLAP_IOU_THRESHOLD = 0.3
 
-# Variance of the Laplacian is a standard cheap sharpness proxy: a crisp
-# image has strong edges everywhere, so the second-derivative filter's
-# output varies a lot pixel to pixel; a motion-blurred frame smears those
-# edges out, so the variance collapses toward zero. A frame scoring below
-# this is treated as unusable -- every downstream check (colour survives
-# blur reasonably well, but ORB and template matching do not) gets worse
-# on a blurred frame, so there's no point running any of them on one.
+# ...EXCEPT for pairs of classes that legitimately overlap in the image.
+# The rubble lies ON TOP of the trapped victim by design, so its box
+# overlaps the victim's box; without this exemption the victim (processed
+# first) would suppress the rubble and it would never be reported. A pair
+# listed here never suppresses each other. Two boxes of the SAME class, or
+# any other class pair, are still de-duplicated as before.
+OVERLAP_ALLOWED_PAIRS = [{"victim", "rubble"}]
+
+# Blur check (RELATIVE, not absolute).
+# Variance of the Laplacian is a cheap sharpness proxy: crisp images have
+# strong edges, motion-blurred ones don't. But the absolute value depends on
+# the scene AND on how the frame was produced -- the camera now captures
+# 2304x1296 and shrinks it to 640x480 with INTER_AREA, which smooths fine
+# detail, so a perfectly still, in-focus frame can score below any fixed
+# number (the old fixed 100 rejected every frame while the robot sat still).
 #
-# This number is scene-dependent (a blank wall is "low variance" even
-# perfectly in focus) -- set it by printing the score on frames you know
-# are sharp vs. frames grabbed mid-pan at your actual driving speed, then
-# picking a threshold that separates them.
-BLUR_VARIANCE_THRESHOLD = 100.0
+# So instead each frame is compared with what this camera/scene has recently
+# looked like when it WAS sharp: a frame is "blurry" only if its sharpness
+# drops well below the recent typical sharpness. A still robot keeps scoring
+# the same every frame, so it is never flagged; a fast pan makes the score
+# fall sharply and is.
+#
+# Limitation: during a continuous blur lasting longer than the window below,
+# the reference slowly decays and the check stops flagging. Real pans are
+# much shorter than that.
+BLUR_RELATIVE_THRESHOLD = 0.5   # blurry if sharpness < this fraction of the recent typical value
+BLUR_REFERENCE_FRAMES = 150     # about 5 s of history at 30 fps
+BLUR_REFERENCE_PERCENTILE = 90  # robust "typical sharp" value, ignores one-off spikes
 # --------------------------------------------
 
 
@@ -78,6 +95,9 @@ class VisionSystem:
     def __init__(self, profiles_file="profiles.pkl"):
         self.colour_detector = ColourDetector(profiles_file)
         self.marker_detector = MarkerDetector()
+        self._sharpness_history = deque(maxlen=BLUR_REFERENCE_FRAMES)
+        self.last_sharpness = 0.0   # latest frame's sharpness (for the on-screen readout)
+        self.last_reference = 0.0   # recent typical sharpness it is compared against
 
         self._ground_distance_configured = None not in (
             CAMERA_HEIGHT_M, CAMERA_TILT_DEG, VERTICAL_FOV_DEG
@@ -94,6 +114,20 @@ class VisionSystem:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         return cv2.Laplacian(gray, cv2.CV_64F).var()
 
+    def _is_blurry(self, frame):
+        """True if this frame is much blurrier than this camera's recent
+        frames (see the BLUR_* constants). Always False until there is some
+        history, and always False for a steady scene."""
+        v = self._blur_variance(frame)
+        self._sharpness_history.append(v)
+        self.last_sharpness = v
+        if len(self._sharpness_history) < 5:
+            self.last_reference = v
+            return False
+        reference = float(np.percentile(self._sharpness_history, BLUR_REFERENCE_PERCENTILE))
+        self.last_reference = reference
+        return v < BLUR_RELATIVE_THRESHOLD * reference
+
     def classify_frame(self, frame):
         """Returns a list of detections, OR None if the frame was too
         motion-blurred to trust. None is deliberately NOT the same as an
@@ -108,7 +142,7 @@ class VisionSystem:
         distance to the object -- EXCEPT markers, which get None on
         purpose (see ground_distance_from_bbox_bottom's docstring for why
         a wall-mounted marker can't use this method)."""
-        if self._blur_variance(frame) < BLUR_VARIANCE_THRESHOLD:
+        if self._is_blurry(frame):
             return None
 
         detections = []
@@ -171,11 +205,15 @@ class VisionSystem:
     def _suppress_overlaps(self, detections):
         """Same rule regardless of which layer(s) produced the overlapping
         boxes: highest confidence first, discard anything that overlaps
-        something already kept."""
+        something already kept -- unless the two classes are a pair that
+        is SUPPOSED to overlap (OVERLAP_ALLOWED_PAIRS, e.g. rubble lying
+        on the victim)."""
         detections = sorted(detections, key=lambda d: d["confidence"], reverse=True)
         kept = []
         for d in detections:
-            if not any(self._iou(d["bbox"], k["bbox"]) > OVERLAP_IOU_THRESHOLD for k in kept):
+            if not any(self._iou(d["bbox"], k["bbox"]) > OVERLAP_IOU_THRESHOLD
+                       and {d["class"], k["class"]} not in OVERLAP_ALLOWED_PAIRS
+                       for k in kept):
                 kept.append(d)
         return kept
 
@@ -250,7 +288,6 @@ def run_live(vision_system):
         cv2.imshow("Vision System (colour + shape + marker)", display)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
-
     camera.release()
     cv2.destroyAllWindows()
 
