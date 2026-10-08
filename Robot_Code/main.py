@@ -16,7 +16,7 @@ the walls, and holds heading from the encoders so neither track falls behind.
     python3 main.py --no-camera          # explore and map only, no vision at all
     python3 main.py --camera-walls       # ALSO use the camera to see walls (off by default)
     python3 main.py --no-centring        # encoder heading hold only, no sonar centring
-    python3 main.py --test-mode          # at a victim: stop and flash yellow (no rescue yet)
+    python3 main.py --test-mode          # demo: find victim, flash all LEDs 5 s, return home
     python3 straight_test.py             # does it drive straight? motors + encoders only
     python3 main.py --base-cell 6,6 --start-heading W   # base in another corner
     python3 main.py --calibrate straight # measure TICKS_PER_M
@@ -340,11 +340,13 @@ SEEK_ATTEMPTS = 2           # tries at a victim cell whose sonar check fails
 # RescueStub's start()/done() and the flashing in Nav._at_victim with its real calls.
 RESCUE_TIME_S = 5.0
 COLLECT_FLASH_HZ = 3.0      # all-LED flash while "collecting"
-# --test-mode: the collection mechanism isn't on the robot yet. On reaching a victim (stopped
-# STOP_DISTANCE_M short) it just stops there and flashes the yellow LED -- no collecting, no
-# trip home -- until the demo time runs out or you quit. Green stays on: it has found one.
+# MOCK COLLECTION (while there's no real mechanism): at a victim it stands still for
+# RESCUE_TIME_S with all three LEDs flashing, then drives home with the victim "aboard".
+# Leave True until Roger's mechanism is wired in; then set it False and put the real calls in
+# RescueStub / Nav._at_victim. --test-mode forces the mock on whatever this says, so a demo can
+# still run find-victim -> flash all LEDs -> return home once the real thing is the default.
+MOCK_COLLECTION = True
 TEST_MODE = False
-TEST_MODE_FLASH_HZ = 2.0
 RELEASE_TIME_S = 2.0        # "releasing" at base, red LED
 
 # --- approach: hold the victim within HEADING_TOLERANCE_DEG -------------------
@@ -1709,7 +1711,7 @@ class Nav:
         self.block_tries = {}        # (cell, heading) -> drives that were blocked
         self.closing_heading = None  # heading CLOSING holds
         self.rescued = 0
-        self._test_stop_reported = False  # --test-mode: said it's stopped at the victim
+        self._mock_announced = None       # arrived_at of the victim the mock collection announced
         self._creeping = False           # a short creep up to the front wall is under way
         self._creeped_cell = None
         self._victim_seen_at = -1e9      # when the camera last saw a victim
@@ -2515,23 +2517,21 @@ class Nav:
     def _at_victim(self):
         """Stopped 10 cm short. The (mock) collection: stand still RESCUE_TIME_S with all
         three LEDs flashing together, then it has the victim and heads home (red on).
-        --test-mode instead stays here flashing yellow."""
+        Without the mock (MOCK_COLLECTION off, no --test-mode) the LEDs stay as the state
+        set them (green) while the real mechanism does its work."""
         self.drive.stop()
-        if TEST_MODE:
-            # No rescue mechanism: stay put, flash yellow where the collecting would be.
-            if not self._test_stop_reported:
-                self._test_stop_reported = True
-                STATUS.event(f"[nav] TEST MODE: at the victim after "
-                             f"{time.monotonic() - self.arrived_at:.1f}s -- stopped, flashing "
-                             "yellow, not collecting")
-            self.leds.yellow(int(time.monotonic() * TEST_MODE_FLASH_HZ * 2) % 2 == 0)
-            return
         if not self.rescue.done():
-            # "Collecting": all three LEDs flash together, in step.
-            on = int(time.monotonic() * COLLECT_FLASH_HZ * 2) % 2 == 0
-            self.leds.green(on)
-            self.leds.yellow(on)
-            self.leds.red(on)
+            if MOCK_COLLECTION or TEST_MODE:
+                # The mock "collecting": all three LEDs flash together, in step.
+                if self._mock_announced != self.arrived_at:
+                    self._mock_announced = self.arrived_at
+                    STATUS.event(f"[nav] {'TEST MODE: ' if TEST_MODE else ''}at the victim -- "
+                                 f"mock collection: flashing all LEDs for {RESCUE_TIME_S:g}s, "
+                                 "then heading home")
+                on = int(time.monotonic() * COLLECT_FLASH_HZ * 2) % 2 == 0
+                self.leds.green(on)
+                self.leds.yellow(on)
+                self.leds.red(on)
             return
         # Remember where it was, for the map: just ahead of where we stopped.
         reach = STOP_DISTANCE_M + CELL_M / 2 - FRONT_WALL_AT_CENTRE_M
@@ -2607,7 +2607,8 @@ def main():
     ap.add_argument("--no-camera-walls", action="store_true",
                     help="(the default) walls from the sonars alone")
     ap.add_argument("--test-mode", action="store_true",
-                    help="at a victim: stop and flash the yellow LED instead of the rescue")
+                    help="demo run: at a victim flash all LEDs for 5 s (mock collection), "
+                         "then return home")
     ap.add_argument("--no-centring", action="store_true",
                     help="don't steer back to the corridor centre -- encoder heading hold only")
     ap.add_argument("--base-cell", default=None,
@@ -2652,8 +2653,8 @@ def main():
 
     if args.test_mode:
         TEST_MODE = True
-        STATUS.event("[nav] --test-mode: will stop at the first victim and flash yellow "
-                     "(no rescue)")
+        STATUS.event("[nav] --test-mode: at each victim, flash all LEDs for "
+                     f"{RESCUE_TIME_S:g}s (mock collection), then return home")
     if args.no_centring:
         CENTRING = False
         STATUS.event("[nav] --no-centring: encoder heading hold only")

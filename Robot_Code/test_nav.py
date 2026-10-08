@@ -1425,56 +1425,73 @@ check("a robot that never turns, after all the retries, drives on rather than ha
       n2.mover.phase == M.Mover.DRIVE and n2.mover.turn_retries == M.TURN_MAX_RETRIES)
 M.STATUS.event = _o
 
-print("31) --test-mode: stop at the victim and flash yellow, no rescue")
+print("31) --test-mode: find the victim, flash all LEDs, return home (the mock collection)")
 
 
 class _BlinkLeds(FakeLeds):
-    def __init__(self): super().__init__(); self.ylog = []
+    def __init__(self): super().__init__(); self.snaps = []
+    def _snap(self): self.snaps.append((self.g, self.y, self.r))
+    def green(self, on): super().green(on); self._snap()
+    def yellow(self, on): super().yellow(on); self._snap()
+    def red(self, on): super().red(on); self._snap()
 
 
-def at_victim_nav():
-    d = FakeDrive()
-    n = M.Nav(d, FakeVision([None]), _BlinkLeds(), _Open())
+def run_collection(seconds=8.0):
+    """Drive _at_victim for `seconds` of fake time; returns (nav, drive, leds, frames, t_done)."""
+    d = FakeDrive(); l = _BlinkLeds()
+    n = M.Nav(d, FakeVision([None]), l, _Open())
     n._enter(M.AT_VICTIM)
-    return n, d
-
-
-check("test mode is OFF by default", M.TEST_MODE is False)
-_old_t = M.time
-_clk = types.SimpleNamespace(t=500.0)
-M.time = types.SimpleNamespace(monotonic=lambda: _clk.t, sleep=lambda s: None)
-M.TEST_MODE = True
-_ev = []
-_o = M.STATUS.event; M.STATUS.event = lambda m: _ev.append(m)
-try:
-    n, d = at_victim_nav()
-    n.leds.ylog.clear()
-    for _i in range(140):                         # 7 s at 20 Hz -- longer than the rescue takes
-        _clk.t += 0.05
-        n._at_victim()
-    check("it stays stopped at the victim", n.state == M.AT_VICTIM and d.last == (0.0, 0.0))
-    check("...and never goes on to collect or return", not n.carrying and n.state != M.RETURN)
-    check("...even well past the time the rescue would have taken (7 s > RESCUE_TIME_S)",
-          _clk.t - 500.0 > M.RESCUE_TIME_S and n.state == M.AT_VICTIM)
-    ys = n.leds.ylog
-    check("the yellow LED flashes (on and off, repeatedly)",
-          ys.count(True) >= 4 and ys.count(False) >= 4)
-    rate = sum(1 for a, b in zip(ys, ys[1:]) if a != b) / 7.0 / 2.0   # 7 s of ticks
-    check(f"...at about {M.TEST_MODE_FLASH_HZ:g} Hz ({rate:.1f})", abs(rate - M.TEST_MODE_FLASH_HZ) < 0.7)
-    check("it says so once", sum("TEST MODE" in e for e in _ev) == 1)
-
-    M.TEST_MODE = False                           # normal mode: collects, then heads home
-    n, d = at_victim_nav()
-    for _i in range(300):
+    n.arrived_at = _clk.t
+    t0, frames, done = _clk.t, [], None
+    while _clk.t - t0 < seconds:
         _clk.t += 0.05
         n._at_victim()
         if n.state != M.AT_VICTIM:
+            done = _clk.t - t0
             break
-    check("without the flag the rescue still runs and it goes home with the victim",
-          n.state == M.RETURN and n.carrying)
+        frames.append((l.g, l.y, l.r))
+    return n, d, l, frames, done
+
+
+check("defaults: the mock collection is on, --test-mode is off",
+      M.MOCK_COLLECTION is True and M.TEST_MODE is False)
+_old_t = M.time
+_clk = types.SimpleNamespace(t=500.0)
+M.time = types.SimpleNamespace(monotonic=lambda: _clk.t, sleep=lambda s: None)
+_ev = []
+_o = M.STATUS.event; M.STATUS.event = lambda m: _ev.append(m)
+_mock, _tm = M.MOCK_COLLECTION, M.TEST_MODE
+try:
+    # --test-mode with the mock switched off (i.e. once a real mechanism is the default)
+    M.MOCK_COLLECTION, M.TEST_MODE = False, True
+    n, d, l, frames, done = run_collection()
+    check("--test-mode: finds the victim, stands still and flashes ALL the LEDs together",
+          done is not None and d.last == (0.0, 0.0)
+          and all(f in ((True, True, True), (False, False, False)) for f in frames)
+          and frames.count((True, True, True)) >= 20 and frames.count((False, False, False)) >= 20)
+    check(f"...for the 5 s collection time ({done:.2f} s), then heads HOME carrying it",
+          4.9 <= done <= 5.2 and n.carrying and n.state == M.RETURN)
+    check("...red alone, solid, on the way home", l.r is True and not l.g and not l.y)
+    check("...and says it's the test-mode mock, once",
+          sum("TEST MODE" in e and "mock collection" in e for e in _ev) == 1)
+
+    # no flag, and the mock off: the real mechanism's turn -- LEDs left as the state set them
+    M.MOCK_COLLECTION, M.TEST_MODE = False, False
+    _ev.clear()
+    n, d, l, frames, done = run_collection()
+    check("no mock and no flag: no LED flashing (that's the real mechanism's to do)",
+          all(f == (True, False, False) for f in frames)
+          and not any("mock collection" in e for e in _ev))
+    check("...it still waits out the collection and goes home", n.carrying and n.state == M.RETURN)
+
+    # the shipped default (mock on) needs no flag
+    M.MOCK_COLLECTION, M.TEST_MODE = True, False
+    n, d, l, frames, done = run_collection()
+    check("default: flashes all LEDs and goes home with no flag at all",
+          frames.count((True, True, True)) >= 20 and n.carrying and n.state == M.RETURN)
 finally:
     M.time = _old_t
-    M.TEST_MODE = False
+    M.MOCK_COLLECTION, M.TEST_MODE = _mock, _tm
     M.STATUS.event = _o
 
 print("32) status LEDs, per the project description")
