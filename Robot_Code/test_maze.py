@@ -106,7 +106,7 @@ class World:
 
     def __init__(self, walls, victims, cell_m, base, start_heading,
                  turn_slip=1.0, left_weak=1.0, noise=0.004, seed=1, x_offset=0.0,
-                 turn_jitter=0.0, locked_tracks=True):
+                 turn_jitter=0.0, locked_tracks=True, tick_scale=1.0):
         self.cell_m = cell_m
         self.segs = []
         size = COLS * cell_m
@@ -126,6 +126,10 @@ class World:
         # tracks run at the same speed whatever the commands (straight_test.py step 5).
         # Only a pivot (tracks counter-rotating) turns it.
         self.locked_tracks = locked_tracks
+        # The encoders count this many times the track travel that really happens (wheel
+        # slip, or TICKS_PER_M set too low): the odometry then thinks it has gone further
+        # than it has and stops short.
+        self.tick_scale = tick_scale
         self.ticks = [0.0, 0.0]
         self.rng = random.Random(seed)
         self.noise = noise
@@ -148,8 +152,8 @@ class World:
         if self.locked_tracks and abs(v) > 1e-9:
             vl = vr = (vl + vr) / 2.0                    # driving: the chassis equalises them
         # Encoders count track travel, whatever the chassis actually does.
-        self.ticks[0] += vl * dt * M.TICKS_PER_M
-        self.ticks[1] += vr * dt * M.TICKS_PER_M
+        self.ticks[0] += vl * dt * M.TICKS_PER_M * self.tick_scale
+        self.ticks[1] += vr * dt * M.TICKS_PER_M * self.tick_scale
         pivoting = abs(v) < 1e-9 and abs(w) > 0.5
         if pivoting and not self._pivoting:           # a new turn: new grip
             self._slip_now = self.turn_slip * (1 + self.rng.gauss(0, self.turn_jitter))
@@ -496,6 +500,24 @@ for slip in (0.90, 1.10):
     check(f"...collected all 3 ({nav.rescued} released by {t:.0f}s), no contact, map right",
           len(world.carried) == 3 and world.min_wall_gap > 0.07
           and world.min_victim_gap > 0.15 and wrong == 0)
+
+print("\n11) encoders that over-count (wheel slip / TICKS_PER_M too small): stops short, then fixes itself")
+tm = true_map(MAZE_1_WALLS, M.CELL_M)
+for scale in (1.0, 1.15):
+    nav, world, leds, states, events, legs, t = run_mission(MAZE_1_WALLS, [], camera=False,
+                                                            tick_scale=scale)
+    wrong = sum(1 for c in nav.map.visited for h in (NORTH, EAST, SOUTH, WEST)
+                if nav.map.wall(c, h) is not None and nav.map.wall(c, h) != tm.wall(c, h))
+    creeps = sum("creeping up" in e for e in events)
+    check(f"encoders x{scale:.2f}: maps all 49 cells ({len(nav.map.visited)}), "
+          f"{wrong} wrong walls, no contact ({world.min_wall_gap*100:.1f} cm)",
+          len(nav.map.visited) == 49 and wrong == 0 and world.min_wall_gap > 0.05)
+    if scale == 1.0:
+        check(f"a correct robot never creeps or changes its scale ({creeps} creeps, "
+              f"scale {nav.odo.dscale:.3f})", creeps == 0 and abs(nav.odo.dscale - 1.0) < 1e-9)
+    else:
+        check(f"...it learned the scale from the walls ({nav.odo.dscale:.3f}, true "
+              f"{1 / scale:.3f})", abs(nav.odo.dscale - 1 / scale) < 0.05 and creeps >= 1)
 
 print(f"\n{'ALL PASSED' if not fails else f'{len(fails)} FAILED'}")
 sys.exit(1 if fails else 0)

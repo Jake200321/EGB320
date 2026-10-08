@@ -60,8 +60,8 @@ for _p in (_REPO_ROOT, _VISION_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from maze import (HEADING_BY_NAME, HEADING_NAME, HEADING_RAD, LEFT_OF,  # noqa: E402
-                  RIGHT_OF, Localiser, MazeMap, Odometry, nearest_heading, wrap)
+from maze import (EAST, HEADING_BY_NAME, HEADING_NAME, HEADING_RAD, LEFT_OF,  # noqa: E402
+                  RIGHT_OF, WEST, Localiser, MazeMap, Odometry, nearest_heading, wrap)
 
 
 # ===========================================================================
@@ -209,6 +209,25 @@ TRIM_MAX_PULSES = 8
 CENTRE_AIM_LEAD_M = 0.28
 CENTRE_AIM_MIN_M = 0.02     # offsets smaller than this aren't worth a pulse (noise)
 CENTRE_AIM_MAX_RAD = 0.15   # ~8.6 deg: never lean further than this
+
+# Stopped short of a cell centre: if, when it stops to sense a cell, the front sonar sees a
+# wall nearer than "not there yet" but not at the cell's own edge, it can't be where the
+# odometry says. A wall ahead of a robot standing at a cell centre is half a cell away
+# (and further walls whole cells beyond that), so a wall at half a cell PLUS a bit means
+# it stopped that bit short -- wheel slip, a scale error in TICKS_PER_M, which adds up
+# along a long corridor where no wall is in sonar range to correct it. Creep up to the
+# wall, then call that the centre.
+CREEP_ENABLED = True
+CREEP_MIN_M = 0.035         # shorter than this is sonar noise, not worth moving for
+CREEP_MAX_M = 0.17          # longer, and it can't be this cell's wall: leave it to the map
+CREEP_VICTIM_HOLD_S = 10.0  # a victim seen this recently might be what the sonar is reading
+# Every time a wall pins down where it really is, the gap to where the odometry said is
+# also a measurement of the odometry's distance scale (the error over the distance driven
+# since the last such wall). The scale is nudged by this much of that each time, within
+# limits, so a TICKS_PER_M that's out by 10% stops mattering after the first corridor.
+SCALE_LEARN_RATE = 0.7
+SCALE_MIN_PATH_M = 0.25     # a shorter run than this says nothing about the scale
+SCALE_LIMITS = (0.6, 1.4)
 
 # Heading hold: the encoders say which way it's pointing, so holding heading is
 # the same thing as not letting either track fall behind the other.
@@ -1657,6 +1676,10 @@ class Nav:
         self.block_tries = {}        # (cell, heading) -> drives that were blocked
         self.closing_heading = None  # heading CLOSING holds
         self.rescued = 0
+        self._creeping = False           # a short creep up to the front wall is under way
+        self._creeped_cell = None
+        self._victim_seen_at = -1e9      # when the camera last saw a victim
+        self._anchor_path = 0.0          # odometry path length when a wall last pinned it down
         self.victim_points = []      # where victims were picked up, for the map
         self.rescue = RescueStub(RESCUE_TIME_S)
         self.release = RescueStub(RELEASE_TIME_S)
@@ -1816,6 +1839,7 @@ class Nav:
         elif seen is not None:
             self.hits, self.misses = self.hits + 1, 0
             self.victim = seen
+            self._victim_seen_at = time.monotonic()
         else:
             self.misses, self.hits = self.misses + 1, 0
 
@@ -2007,6 +2031,8 @@ class Nav:
             fresh = all(self.sonar.since(n, self.sense_from[n])[0] for n in fitted)
             if not fresh and now - self.sense_from["front"] < SENSE_TIMEOUT_S:
                 return                             # wait for a full set of pings
+            if self._front_creep(fitted):
+                return                             # creeping up to the front wall first
             self._record_walls(fitted)
             self.sensing = False
 
@@ -2089,7 +2115,78 @@ class Nav:
             self.map.set_wall(self.cell, heading, present)
         self.map.visited.add(self.cell)
 
+    def _learn_scale(self, short):
+        """Fold one "it was `short` metres short of the wall" into the distance scale.
+
+        short > 0: the odometry went further than the robot did, so its scale is too big.
+        Needs a decent run since the last anchor, or a few cm of noise looks like a scale.
+        """
+        o = self.odo
+        path = o.path_m - self._anchor_path
+        self._anchor_path = o.path_m
+        if path < SCALE_MIN_PATH_M or not hasattr(o, "dscale"):
+            return
+        # An ordinary stop is always a centimetre or so short (it arrives within a tolerance
+        # of the target). Learn from that and a perfect robot slowly decides its scale is
+        # wrong; only a gap bigger than that is a scale error.
+        if abs(short) < CREEP_MIN_M:
+            return
+        factor = (path - short) / path                  # real distance / odometry's
+        new = o.dscale * (1.0 - SCALE_LEARN_RATE * (1.0 - factor))
+        new = max(SCALE_LIMITS[0], min(SCALE_LIMITS[1], new))
+        if abs(new - o.dscale) > 0.004:
+            STATUS.event(f"[odo] distance scale {o.dscale:.3f} -> {new:.3f} "
+                         f"({short*100:+.0f}cm out over {path*100:.0f}cm driven)")
+        o.dscale = new
+
+    def _front_creep(self, fitted):
+        """If it stopped short of this cell's centre, start a creep up to the front wall.
+
+        True if a creep was started (the cell is then sensed again on arrival).
+        """
+        if (not CREEP_ENABLED or "front" not in fitted or self._creeped_cell == self.cell
+                or self.state in (SEEK, APPROACH, CLOSING, AT_VICTIM)):
+            return False
+        if time.monotonic() - self._victim_seen_at < CREEP_VICTIM_HOLD_S:
+            return False       # the sonar is likely reading the victim, not a wall
+        ok, reading = self.sonar.since("front", self.sense_from["front"])
+        if not ok or reading is None:
+            return False
+        # How far short: where the wall is minus where it would be from the centre.
+        short = reading - FRONT_WALL_AT_CENTRE_M
+        if -CREEP_MAX_M / 3 <= short <= CREEP_MAX_M:
+            self._learn_scale(short)         # a wall within this cell: a real measurement
+        if not CREEP_MIN_M <= short <= CREEP_MAX_M:
+            return False
+        if (self.map.neighbour(self.cell, self.facing) == self.victim_cell
+                or self.map.neighbour(self.cell, self.facing) in self.map.blocked):
+            return False                     # that's a victim/rubble in the next cell, not a wall
+        self._creeped_cell = self.cell
+        self._creeping = True
+        ux, uy = math.cos(HEADING_RAD[self.facing]), math.sin(HEADING_RAD[self.facing])
+        STATUS.event(f"[nav] {self.cell}: stopped {short*100:.0f}cm short of the centre (front wall "
+                     f"at {reading*100:.0f}cm, should be {FRONT_WALL_AT_CENTRE_M*100:.0f}cm) -- "
+                     "creeping up to it")
+        self.move_heading = self.facing
+        self.target_cell = self.cell
+        self.sense_from = None
+        self.mover.move_to(self.odo.x + short * ux, self.odo.y + short * uy,
+                           HEADING_RAD[self.facing])
+        return True
+
     def _arrived(self):
+        if self._creeping:
+            # The sonar says it's at the wall, which is the cell edge: this IS the centre.
+            # Pull the odometry's along-track position onto it so the error doesn't carry on.
+            self._creeping = False
+            cx, cy = self.map.centre(self.cell)
+            if self.facing in (EAST, WEST):
+                self.odo.x = cx
+            else:
+                self.odo.y = cy
+            self.sense_from = None
+            self.sensing = True
+            return
         if self.rejoin_stage == "point":
             # At the cell centre; now square up to the nearest cardinal heading so
             # the walls can be read.

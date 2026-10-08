@@ -319,6 +319,12 @@ class Localiser(Odometry):
         super().__init__(ticks_per_m, track_m, x, y, theta)
         self.mounts = mounts          # name -> (forward m, left m, direction rad)
         self.k = 1.0
+        # Distance scale, learned by the nav from walls it can see (see Nav._front_creep):
+        # how much of the encoder-counted track travel really happened. 1.0 = TICKS_PER_M is
+        # right; < 1 = the tracks slip or TICKS_PER_M is too small, so counted distance
+        # over-states the real one.
+        self.dscale = 1.0
+        self.path_m = 0.0             # distance driven by the odometry's own reckoning
         # Placed by hand: good to a couple of cm and a few degrees, no better.
         self.P = [[0.02 ** 2, 0, 0, 0], [0, 0.02 ** 2, 0, 0],
                   [0, 0, math.radians(4) ** 2, 0], [0, 0, 0, 0.003]]
@@ -338,7 +344,8 @@ class Localiser(Odometry):
         self._prev = ticks
         self.left_m += dl
         self.right_m += dr
-        ds = (dl + dr) / 2.0
+        ds = (dl + dr) / 2.0 * self.dscale
+        self.path_m += abs(ds)
         dth_enc = (dr - dl) / self.track_m
         dth = self.k * dth_enc
         mid = self.theta + dth / 2.0

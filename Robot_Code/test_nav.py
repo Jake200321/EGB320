@@ -1300,5 +1300,70 @@ check("the old name wins if both exist (it's the one nav's default of 0 = off is
                                                 BLUR_RELATIVE_THRESHOLD=0.3))
       == "BLUR_VARIANCE_THRESHOLD")
 
+print("29) stopped short of a cell centre: creep up to the wall, learn the distance scale")
+_ev = []
+_o = M.STATUS.event; M.STATUS.event = lambda m: _ev.append(m)
+
+
+def creep_nav(front, path=1.0):
+    """A nav standing in an unvisited cell facing north with `front` on the front sonar."""
+    n = M.Nav(LogDrive(), FakeVision([None]), FakeLeds(), _Front(front))
+    n.cell, n.facing = (0, 4), M.NORTH if hasattr(M, "NORTH") else 0
+    n.odo.reset(*n.map.centre((0, 4)), M.HEADING_RAD[0])
+    n.sense_from = {k: 0.0 for k in ("front", "left", "right")}
+    n.odo.path_m = path
+    return n
+
+
+_half = M.FRONT_WALL_AT_CENTRE_M
+n = creep_nav(_half + 0.10)
+_y0 = n.odo.y
+check("a wall 10 cm further than it should be -> starts a creep", n._front_creep(["front"]) is True)
+check("...aimed 10 cm ahead", abs(n.mover.target[1] - (_y0 + 0.10)) < 1e-9)
+check("...and says so, with how short it was", any("10cm short" in e and "creeping" in e for e in _ev))
+n._arrived()
+check("on arrival the along-track position is pulled onto the cell centre",
+      abs(n.odo.y - n.map.centre((0, 4))[1]) < 1e-9 and n.sensing is True)
+check("...and the cell is sensed again from there", n.sense_from is None)
+n = creep_nav(_half + 0.10)
+n._front_creep(["front"])
+check("only one creep per cell (it can't loop)", n._front_creep(["front"]) is False)
+check("reading a normal wall distance -> no creep", creep_nav(_half + 0.01)._front_creep(["front"]) is False)
+check("a wall a whole cell further off isn't this cell's -> no creep",
+      creep_nav(_half + 0.28)._front_creep(["front"]) is False)
+n = creep_nav(_half + 0.10); n._victim_seen_at = time.monotonic()
+check("a victim seen a moment ago might be what the sonar reads -> no creep",
+      n._front_creep(["front"]) is False)
+n = creep_nav(_half + 0.10); n.victim_cell = n.map.neighbour(n.cell, 0)
+check("the next cell is a known victim cell -> no creep", n._front_creep(["front"]) is False)
+M.CREEP_ENABLED = False
+check("CREEP_ENABLED = False turns it off", creep_nav(_half + 0.10)._front_creep(["front"]) is False)
+M.CREEP_ENABLED = True
+
+n = creep_nav(_half + 0.10, path=1.0)
+n._learn_scale(0.10)
+check("10 cm out over a metre -> scale drops (odometry over-counts)",
+      abs(n.odo.dscale - (1 - M.SCALE_LEARN_RATE * 0.10)) < 1e-9)
+n = creep_nav(_half, path=1.0)
+n._learn_scale(0.01)
+check("a centimetre out is just a stop's tolerance -> scale untouched", n.odo.dscale == 1.0)
+n = creep_nav(_half, path=0.1)
+n._learn_scale(0.10)
+check("too short a run to say anything about the scale", n.odo.dscale == 1.0)
+n = creep_nav(_half, path=1.0)
+n._learn_scale(-0.04)
+check("overshot (wall nearer than expected) -> scale goes UP", n.odo.dscale > 1.0)
+n = creep_nav(_half, path=1.0)
+for _i in range(30):
+    n.odo.path_m += 1.0
+    n._learn_scale(0.5)
+check("the scale never leaves its limits", M.SCALE_LIMITS[0] <= n.odo.dscale <= M.SCALE_LIMITS[1])
+n = creep_nav(_half, path=1.0)
+n.odo.dscale = 0.9
+n.odo.update((0, 0)); n.odo.update((int(0.5 * M.TICKS_PER_M), int(0.5 * M.TICKS_PER_M)))
+check("the odometry applies the scale to the distance it integrates (0.5 m counted -> 0.45)",
+      abs(math.hypot(n.odo.x - n.map.centre((0, 4))[0], n.odo.y - n.map.centre((0, 4))[1]) - 0.45) < 0.01)
+M.STATUS.event = _o
+
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)
