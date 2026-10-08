@@ -519,5 +519,32 @@ for scale in (1.0, 1.15):
         check(f"...it learned the scale from the walls ({nav.odo.dscale:.3f}, true "
               f"{1 / scale:.3f})", abs(nav.odo.dscale - 1 / scale) < 0.05 and creeps >= 1)
 
+print("\n12) status LEDs over a whole mission, checked on every tick")
+samples = []
+def sample(n):
+    L = n.leds
+    samples.append((n.state, n.carrying, L.g, L.y, L.r))
+    return False
+nav, world, leds, states, events, legs, t = run_mission(MAZE_1_WALLS, [(2, 2), (2, 1), (5, 5)],
+                                                        stop_when=sample)
+def colour(g, y, r):
+    return "G" if g and not y and not r else "Y" if y and not g and not r else \
+           "R" if r and not g and not y else "-" if not (g or y or r) else "?"
+seq = [colour(*s[2:]) for s in samples]
+check(f"never more than one LED lit at once ({seq.count('?')} ticks with a clash)", "?" not in seq)
+check("yellow whenever it is searching",
+      all(colour(*s[2:]) == "Y" for s in samples if s[0] == M.SEARCH))
+check("green whenever it is going to / closing on / collecting a victim",
+      all(colour(*s[2:]) == "G" for s in samples
+          if s[0] in (M.SEEK, M.APPROACH, M.CLOSING, M.AT_VICTIM)))
+check("red whenever it is taking a victim home, and ONLY then",
+      all((colour(*s[2:]) == "R") == (s[0] in (M.RETURN, M.AT_BASE) and s[1]) for s in samples))
+check("yellow when heading home with nothing aboard",
+      all(colour(*s[2:]) == "Y" for s in samples if s[0] == M.RETURN and not s[1]))
+runs = [k for i, k in enumerate(seq) if i == 0 or k != seq[i - 1]]
+check(f"each rescue shows yellow -> green -> red -> yellow ({''.join(runs)[:24]}...)",
+      "".join(runs).startswith("YGRYGRY"))
+check("it's yellow from the very first tick", seq[0] == "Y")
+
 print(f"\n{'ALL PASSED' if not fails else f'{len(fails)} FAILED'}")
 sys.exit(1 if fails else 0)

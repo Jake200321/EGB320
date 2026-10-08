@@ -1477,5 +1477,58 @@ finally:
     M.TEST_MODE = False
     M.STATUS.event = _o
 
+print("32) status LEDs, per the project description")
+# Yellow = searching/exploring. Green = victim detected & collection in progress.
+# Red = returning to base with a victim. Exactly one lit at a time; none when finished.
+_RULES = [
+    (M.SEARCH, False, "yellow"), (M.SEEK, False, "green"), (M.APPROACH, False, "green"),
+    (M.CLOSING, False, "green"), (M.AT_VICTIM, False, "green"),
+    (M.RETURN, True, "red"), (M.AT_BASE, True, "red"),
+    (M.RETURN, False, "yellow"),      # heading home with nothing aboard: still just exploring
+]
+for _state, _carry, _want in _RULES:
+    l = FakeLeds()
+    n = M.Nav(FakeDrive(), FakeVision([None]), l, _Open())
+    n.state, n.carrying = _state, _carry
+    n._set_leds()
+    lit = [c for c, v in (("green", l.g), ("yellow", l.y), ("red", l.r)) if v]
+    check(f"{_state}{' + carrying' if _carry else ''}: only {_want} is lit", lit == [_want])
+
+l = FakeLeds()
+n = M.Nav(FakeDrive(), FakeVision([None]), l, _Open())
+n.state = M.SEARCH; n._set_leds()
+n._enter(M.DONE); n._done()
+check("finished (DONE): everything is off", not (l.g or l.y or l.r))
+l = FakeLeds()
+n = M.Nav(FakeDrive(), FakeVision([None]), l, _Open())
+n.step()
+check("lit from the very first tick: yellow while it starts searching",
+      l.y is True and not l.g and not l.r)
+
+# a victim collected: green all through collecting, red the moment it's aboard
+l = FakeLeds()
+n = M.Nav(FakeDrive(), FakeVision([None]), l, _Open())
+n._enter(M.AT_VICTIM)
+check("stopped at the victim, collecting: green", l.g is True and not l.y and not l.r)
+_t0 = M.time
+_c = types.SimpleNamespace(t=10.0)
+M.time = types.SimpleNamespace(monotonic=lambda: _c.t, sleep=lambda s: None)
+try:
+    n.arrived_at = _c.t
+    n.rescue.start()
+    _c.t += M.RESCUE_TIME_S + 0.1
+    n._at_victim()
+finally:
+    M.time = _t0
+check("the moment it's picked up (carrying): red, green and yellow off",
+      n.carrying and l.r is True and not l.g and not l.y)
+n.state = M.AT_BASE
+n.release.start()
+n._set_leds()
+check("at base releasing it: still red", l.r is True and not l.g and not l.y)
+n.carrying = False
+n._enter(M.SEARCH)
+check("released, back out to search: yellow", l.y is True and not l.g and not l.r)
+
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)
