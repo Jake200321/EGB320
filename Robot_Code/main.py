@@ -219,7 +219,11 @@ CENTRE_AIM_MAX_RAD = 0.15   # ~8.6 deg: never lean further than this
 # wall, then call that the centre.
 CREEP_ENABLED = True
 CREEP_MIN_M = 0.035         # shorter than this is sonar noise, not worth moving for
-CREEP_MAX_M = 0.17          # longer, and it can't be this cell's wall: leave it to the map
+CREEP_MAX_M = 0.17          # longer, and it can't be this cell's wall: leave it to the map...
+CREEP_PATH_SHARE = 0.16     # ...unless it has driven far since a wall last pinned it down: an
+                            # odometry that's out by up to this share of the distance driven
+CREEP_ABS_MAX_M = 0.26      # can reach this far, no further: a wall a whole cell on from the
+                            # centre reads 0.28, and "stopped 28 cm short" can't be told from it
 CREEP_VICTIM_HOLD_S = 10.0  # a victim seen this recently might be what the sonar is reading
 # Every time a wall pins down where it really is, the gap to where the odometry said is
 # also a measurement of the odometry's distance scale (the error over the distance driven
@@ -2031,6 +2035,7 @@ class Nav:
             fresh = all(self.sonar.since(n, self.sense_from[n])[0] for n in fitted)
             if not fresh and now - self.sense_from["front"] < SENSE_TIMEOUT_S:
                 return                             # wait for a full set of pings
+            self._trace_stop(fitted)
             if self._front_creep(fitted):
                 return                             # creeping up to the front wall first
             self._record_walls(fitted)
@@ -2115,6 +2120,30 @@ class Nav:
             self.map.set_wall(self.cell, heading, present)
         self.map.visited.add(self.cell)
 
+    def _trace_stop(self, fitted):
+        """One line per cell stop: what the sonars read and where the odometry thinks it is.
+
+        `off` is the odometry's position against the cell centre, along the way it faces
+        and across it; if the robot is physically further short than that says, the front
+        reading shows it (a wall ahead reads ~6cm from a centred stop).
+        """
+        if getattr(self, "_traced_cell", None) == self.cell:
+            return
+        self._traced_cell = self.cell
+        parts = []
+        for name in ("front", "left", "right"):
+            if name in fitted:
+                ok, d = self.sonar.since(name, self.sense_from[name])
+                parts.append(f"{name[0].upper()} {'--' if not ok or d is None else f'{d*100:.0f}'}")
+        cx, cy = self.map.centre(self.cell)
+        h = HEADING_RAD[self.facing]
+        along = (self.odo.x - cx) * math.cos(h) + (self.odo.y - cy) * math.sin(h)
+        across = (self.odo.x - cx) * math.sin(h) - (self.odo.y - cy) * math.cos(h)
+        STATUS.event(f"[stop] {self.cell}{HEADING_NAME[self.facing]}  sonar {' '.join(parts)} cm  "
+                     f"odo off centre {along*100:+.0f}cm along {across*100:+.0f}cm across  "
+                     f"scale {getattr(self.odo, 'dscale', 1.0):.3f}  "
+                     f"heading {math.degrees(wrap(self.odo.theta - h)):+.1f}deg")
+
     def _learn_scale(self, short):
         """Fold one "it was `short` metres short of the wall" into the distance scale.
 
@@ -2154,9 +2183,17 @@ class Nav:
             return False
         # How far short: where the wall is minus where it would be from the centre.
         short = reading - FRONT_WALL_AT_CENTRE_M
-        if -CREEP_MAX_M / 3 <= short <= CREEP_MAX_M:
+        # The further it has driven since a wall last told it where it is, the more error
+        # it can have built up, so the further short it may plausibly be.
+        path = self.odo.path_m - self._anchor_path
+        reach = min(CREEP_ABS_MAX_M, max(CREEP_MAX_M, CREEP_PATH_SHARE * path))
+        if -CREEP_MAX_M / 3 <= short <= reach:
             self._learn_scale(short)         # a wall within this cell: a real measurement
-        if not CREEP_MIN_M <= short <= CREEP_MAX_M:
+        if not CREEP_MIN_M <= short <= reach:
+            if short > reach and short < 0.32:
+                STATUS.event(f"[nav] {self.cell}: front wall {short*100:.0f}cm beyond a centred "
+                             f"stop -- too far to be this cell's wall (reach {reach*100:.0f}cm "
+                             f"after {path*100:.0f}cm driven), not creeping")
             return False
         if (self.map.neighbour(self.cell, self.facing) == self.victim_cell
                 or self.map.neighbour(self.cell, self.facing) in self.map.blocked):

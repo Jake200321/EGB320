@@ -1363,6 +1363,26 @@ n.odo.dscale = 0.9
 n.odo.update((0, 0)); n.odo.update((int(0.5 * M.TICKS_PER_M), int(0.5 * M.TICKS_PER_M)))
 check("the odometry applies the scale to the distance it integrates (0.5 m counted -> 0.45)",
       abs(math.hypot(n.odo.x - n.map.centre((0, 4))[0], n.odo.y - n.map.centre((0, 4))[1]) - 0.45) < 0.01)
+
+_ev.clear()
+n = creep_nav(_half + 0.22, path=1.6)           # 22 cm short after a long corridor
+check("after a long run (1.6 m since a wall) a 22 cm gap is within reach -> creeps",
+      n._front_creep(["front"]) is True)
+_ev.clear()
+n = creep_nav(_half + 0.22, path=0.4)           # same gap after only 40 cm: not plausible
+check("...but the same gap after only 40 cm driven isn't -> no creep, and says why",
+      n._front_creep(["front"]) is False and any("too far to be this cell's wall" in e for e in _ev))
+n = creep_nav(_half + 0.29, path=3.0)
+check("a gap of 29 cm is a whole cell off (an open cell, then a wall): never creeps",
+      n._front_creep(["front"]) is False)
+_ev.clear()
+n = creep_nav(_half + 0.10)
+n.sense_from = {k: 0.0 for k in ("front", "left", "right")}
+n._trace_stop(["front", "left", "right"])
+check("each stop prints one trace line with the sonar readings and the odometry offset",
+      len(_ev) == 1 and "[stop]" in _ev[0] and "odo off centre" in _ev[0] and "F 16" in _ev[0])
+n._trace_stop(["front", "left", "right"])
+check("...and only once per cell", len(_ev) == 1)
 M.STATUS.event = _o
 
 print(f"\n{len(fails)} failed")
