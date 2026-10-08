@@ -1494,6 +1494,28 @@ finally:
     M.MOCK_COLLECTION, M.TEST_MODE = _mock, _tm
     M.STATUS.event = _o
 
+# test mode finishes after ONE victim; the normal run goes back out for the next
+for _tm, _want_done in ((True, True), (False, False)):
+    M.TEST_MODE = _tm
+    _ev2 = []
+    _o2 = M.STATUS.event; M.STATUS.event = lambda m: _ev2.append(m)
+    _t1 = M.time
+    _c2 = types.SimpleNamespace(t=900.0)
+    M.time = types.SimpleNamespace(monotonic=lambda: _c2.t, sleep=lambda s: None)
+    try:
+        n = M.Nav(FakeDrive(), FakeVision([None]), FakeLeds(), _Open())
+        n.state, n.carrying = M.AT_BASE, True
+        n.release.start()
+        _c2.t += M.RELEASE_TIME_S + 0.1
+        n._at_base()
+    finally:
+        M.time = _t1; M.STATUS.event = _o2; M.TEST_MODE = False
+    check(f"first victim home{' in --test-mode' if _tm else ' (normal run)'}: "
+          f"{'finished, saying why' if _want_done else 'back out to search for the next'}",
+          (n.state == M.DONE and any("TEST MODE" in e and "1 victim rescued" in e for e in _ev2))
+          if _want_done else n.state == M.SEARCH)
+check("--test-mode's target is one victim", M.TEST_MODE_VICTIMS == 1)
+
 print("32) status LEDs, per the project description")
 # Yellow = searching/exploring. Green = victim detected & collection in progress.
 # Red = returning to base with a victim. Exactly one lit at a time; none when finished.

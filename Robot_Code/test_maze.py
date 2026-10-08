@@ -558,19 +558,23 @@ check(f"each rescue shows yellow -> green -> flashing -> red -> yellow ({''.join
       "".join(runs).startswith("YGFRYGFRY"))
 check("it's yellow from the very first tick", seq[0] == "Y")
 
-print("\n13) --test-mode (mock forced on, default off): the same demo end to end")
+print("\n13) --test-mode: ONE victim, flash all LEDs, home, done")
 _mock0, _tm0 = M.MOCK_COLLECTION, M.TEST_MODE
 M.MOCK_COLLECTION, M.TEST_MODE = False, True
 try:
     nav, world, leds, states, events, legs, t = run_mission(MAZE_1_WALLS, [(2, 2), (2, 1), (5, 5)])
 finally:
     M.MOCK_COLLECTION, M.TEST_MODE = _mock0, _tm0
-check(f"finds all 3, flashes all LEDs at each, takes each home ({nav.rescued} released by {t:.0f}s)",
-      len(world.carried) == 3 and nav.rescued >= 2 and nav.state == M.DONE or (t >= M.MISSION_TIME_S - 1))
-check("it announced the test-mode mock at the victims",
-      sum("TEST MODE" in e and "mock collection" in e for e in events) >= 2)
-check("it doesn't stay at the first victim: it returned to base with it (a red trip)",
-      any(k == "r" and on for k, on in leds.log) and M.RETURN in states)
+check(f"collects exactly one victim ({len(world.carried)}) and takes it home ({nav.rescued} rescued)",
+      len(world.carried) == 1 and nav.rescued == 1)
+check(f"then it's finished, back at the base, well inside the time ({t:.0f}s)",
+      nav.state == M.DONE and world.cell() == (0, 6) and t < M.MISSION_TIME_S - 30)
+check("it said why it finished", any("FINISHED" in e and "TEST MODE" in e and "1 victim rescued" in e
+                                     for e in events))
+check("announced the mock collection once", sum("TEST MODE" in e and "mock collection" in e
+                                               for e in events) == 1)
+check("LEDs: yellow -> green -> all flashing -> red home -> off at the end",
+      any(k == "r" and on for k, on in leds.log) and not (leds.g or leds.y or leds.r))
 
 print(f"\n{'ALL PASSED' if not fails else f'{len(fails)} FAILED'}")
 sys.exit(1 if fails else 0)

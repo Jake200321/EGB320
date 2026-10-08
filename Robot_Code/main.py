@@ -16,7 +16,7 @@ the walls, and holds heading from the encoders so neither track falls behind.
     python3 main.py --no-camera          # explore and map only, no vision at all
     python3 main.py --camera-walls       # ALSO use the camera to see walls (off by default)
     python3 main.py --no-centring        # encoder heading hold only, no sonar centring
-    python3 main.py --test-mode          # demo: find victim, flash all LEDs 5 s, return home
+    python3 main.py --test-mode          # demo: ONE victim, flash all LEDs 5 s, home, done
     python3 straight_test.py             # does it drive straight? motors + encoders only
     python3 main.py --base-cell 6,6 --start-heading W   # base in another corner
     python3 main.py --calibrate straight # measure TICKS_PER_M
@@ -144,6 +144,7 @@ BASE_CELL = (0, 6)          # (col, row); row 0 is the NORTH edge
 START_HEADING = "N"         # which way the robot faces in the base cell
 MISSION_TIME_S = 420.0      # the 7-minute demo -- motors stop when it's up
 VICTIMS_TOTAL = 3           # stop once this many are home
+TEST_MODE_VICTIMS = 1       # --test-mode: one victim, home, done
 # When two open sides are equally good, which to try first. Straight on always
 # beats both, because a turn costs time and heading accuracy.
 EXPLORE_PREFER_RIGHT = True
@@ -1730,7 +1731,7 @@ class Nav:
         self.finish_reason = reason
         where = f"cell {self.cell}, {len(self.map.visited)} visited, {self.rescued} rescued"
         STATUS.event(f"[nav] *** FINISHED: {reason} ({where}, "
-                     f"{self.elapsed():.0f}s in) ***")
+                     f"{(self.elapsed() or 0.0):.0f}s in) ***")
         self._enter(DONE)
 
     def _enter(self, state):
@@ -2561,8 +2562,10 @@ class Nav:
         self.carrying = False
         self.rescued += 1
         STATUS.event(f"[nav] VICTIM RESCUED -- {self.rescued} home")
-        if self.rescued >= VICTIMS_TOTAL:
-            self._finish(f"all {VICTIMS_TOTAL} victims rescued")
+        target = TEST_MODE_VICTIMS if TEST_MODE else VICTIMS_TOTAL
+        if self.rescued >= target:
+            self._finish(f"{'TEST MODE: ' if TEST_MODE else ''}all {target} "
+                         f"victim{'s' if target != 1 else ''} rescued")
         else:
             self._enter(SEARCH)
 
@@ -2607,8 +2610,8 @@ def main():
     ap.add_argument("--no-camera-walls", action="store_true",
                     help="(the default) walls from the sonars alone")
     ap.add_argument("--test-mode", action="store_true",
-                    help="demo run: at a victim flash all LEDs for 5 s (mock collection), "
-                         "then return home")
+                    help="demo run: find ONE victim, flash all LEDs for 5 s (mock collection), "
+                         "return home and finish")
     ap.add_argument("--no-centring", action="store_true",
                     help="don't steer back to the corridor centre -- encoder heading hold only")
     ap.add_argument("--base-cell", default=None,
@@ -2653,8 +2656,8 @@ def main():
 
     if args.test_mode:
         TEST_MODE = True
-        STATUS.event("[nav] --test-mode: at each victim, flash all LEDs for "
-                     f"{RESCUE_TIME_S:g}s (mock collection), then return home")
+        STATUS.event(f"[nav] --test-mode: collect {TEST_MODE_VICTIMS} victim (all LEDs flash for "
+                     f"{RESCUE_TIME_S:g}s), return home, then finish")
     if args.no_centring:
         CENTRING = False
         STATUS.event("[nav] --no-centring: encoder heading hold only")
