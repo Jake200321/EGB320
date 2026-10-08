@@ -619,6 +619,11 @@ try:
     _cyan[320:390, 250:390] = (255, 255, 0)                       # BGR cyan on the floor
     _empty = _rng.integers(45, 95, (480, 640, 3), dtype=np.uint8)
 
+    # The vision team's blur guard is RELATIVE: a frame is "blurred" only against the camera's
+    # own recent sharp frames, so it needs some history first (a lone frame is never flagged).
+    for _ in range(6):
+        _frames.append(_empty.copy())
+        _vision.look()
     _frames.append(_flat)
     check("blurred frame returns UNUSABLE", _vision.look() is M.UNUSABLE)
     check("...and is reported as a rejection", "BLUR-REJECT" in M.vision_summary(_vision))
