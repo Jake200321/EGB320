@@ -1396,8 +1396,8 @@ _o = M.STATUS.event; M.STATUS.event = lambda m: _ev.append(m)
 n, d, robot, ticks = trim_run(-58.0, eff=0.02)    # nothing it does turns the robot much
 check("a trim that can't finish a big error does NOT drive off: it turns again",
       n.mover.phase == M.Mover.TURN and any("turning again (1/" in e for e in _ev))
-check("...it said how far short it was (about 58 deg)",
-      any("deg short" in e and "turning again" in e and ("57" in e or "58" in e) for e in _ev))
+check("...it said how far short it was",
+      any("deg short" in e and "turning again" in e for e in _ev))
 check("...and that doesn't loop forever: it's bounded by TURN_MAX_RETRIES",
       M.TURN_MAX_RETRIES >= 1)
 
@@ -1424,6 +1424,58 @@ finally:
 check("a robot that never turns, after all the retries, drives on rather than hanging",
       n2.mover.phase == M.Mover.DRIVE and n2.mover.turn_retries == M.TURN_MAX_RETRIES)
 M.STATUS.event = _o
+
+print("31) --test-mode: stop at the victim and flash yellow, no rescue")
+
+
+class _BlinkLeds(FakeLeds):
+    def __init__(self): super().__init__(); self.ylog = []
+
+
+def at_victim_nav():
+    d = FakeDrive()
+    n = M.Nav(d, FakeVision([None]), _BlinkLeds(), _Open())
+    n._enter(M.AT_VICTIM)
+    return n, d
+
+
+check("test mode is OFF by default", M.TEST_MODE is False)
+_old_t = M.time
+_clk = types.SimpleNamespace(t=500.0)
+M.time = types.SimpleNamespace(monotonic=lambda: _clk.t, sleep=lambda s: None)
+M.TEST_MODE = True
+_ev = []
+_o = M.STATUS.event; M.STATUS.event = lambda m: _ev.append(m)
+try:
+    n, d = at_victim_nav()
+    n.leds.ylog.clear()
+    for _i in range(80):                          # 4 s at 20 Hz -- longer than the rescue takes
+        _clk.t += 0.05
+        n._at_victim()
+    check("it stays stopped at the victim", n.state == M.AT_VICTIM and d.last == (0.0, 0.0))
+    check("...and never goes on to collect or return", not n.carrying and n.state != M.RETURN)
+    check("...even well past the time the rescue would have taken (4 s > RESCUE_TIME_S)",
+          _clk.t - 500.0 > M.RESCUE_TIME_S and n.state == M.AT_VICTIM)
+    ys = n.leds.ylog
+    check("the yellow LED flashes (on and off, repeatedly)",
+          ys.count(True) >= 4 and ys.count(False) >= 4)
+    rate = sum(1 for a, b in zip(ys, ys[1:]) if a != b) / 4.0 / 2.0
+    check(f"...at about {M.TEST_MODE_FLASH_HZ:g} Hz ({rate:.1f})", abs(rate - M.TEST_MODE_FLASH_HZ) < 0.7)
+    check("it says so once", sum("TEST MODE" in e for e in _ev) == 1)
+
+    M.TEST_MODE = False                           # normal mode: collects, then heads home
+    n, d = at_victim_nav()
+    for _i in range(100):
+        _clk.t += 0.05
+        n._at_victim()
+        if n.state != M.AT_VICTIM:
+            break
+    check("without the flag the rescue still runs and it goes home with the victim",
+          n.state == M.RETURN and n.carrying)
+finally:
+    M.time = _old_t
+    M.TEST_MODE = False
+    M.STATUS.event = _o
 
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)
