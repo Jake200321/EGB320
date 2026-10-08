@@ -1449,23 +1449,23 @@ _o = M.STATUS.event; M.STATUS.event = lambda m: _ev.append(m)
 try:
     n, d = at_victim_nav()
     n.leds.ylog.clear()
-    for _i in range(80):                          # 4 s at 20 Hz -- longer than the rescue takes
+    for _i in range(140):                         # 7 s at 20 Hz -- longer than the rescue takes
         _clk.t += 0.05
         n._at_victim()
     check("it stays stopped at the victim", n.state == M.AT_VICTIM and d.last == (0.0, 0.0))
     check("...and never goes on to collect or return", not n.carrying and n.state != M.RETURN)
-    check("...even well past the time the rescue would have taken (4 s > RESCUE_TIME_S)",
+    check("...even well past the time the rescue would have taken (7 s > RESCUE_TIME_S)",
           _clk.t - 500.0 > M.RESCUE_TIME_S and n.state == M.AT_VICTIM)
     ys = n.leds.ylog
     check("the yellow LED flashes (on and off, repeatedly)",
           ys.count(True) >= 4 and ys.count(False) >= 4)
-    rate = sum(1 for a, b in zip(ys, ys[1:]) if a != b) / 4.0 / 2.0
+    rate = sum(1 for a, b in zip(ys, ys[1:]) if a != b) / 7.0 / 2.0   # 7 s of ticks
     check(f"...at about {M.TEST_MODE_FLASH_HZ:g} Hz ({rate:.1f})", abs(rate - M.TEST_MODE_FLASH_HZ) < 0.7)
     check("it says so once", sum("TEST MODE" in e for e in _ev) == 1)
 
     M.TEST_MODE = False                           # normal mode: collects, then heads home
     n, d = at_victim_nav()
-    for _i in range(100):
+    for _i in range(300):
         _clk.t += 0.05
         n._at_victim()
         if n.state != M.AT_VICTIM:
@@ -1529,6 +1529,53 @@ check("at base releasing it: still red", l.r is True and not l.g and not l.y)
 n.carrying = False
 n._enter(M.SEARCH)
 check("released, back out to search: yellow", l.y is True and not l.g and not l.r)
+
+print("33) the (mock) collection: 5 s stood still, all three LEDs flashing together, then home")
+check("the mock collection lasts 5 seconds", M.RESCUE_TIME_S == 5.0)
+
+
+class _Led3(FakeLeds):
+    """Records all three LEDs after every call, to see them change together."""
+    def __init__(self):
+        super().__init__(); self.snap = []
+    def _rec(self): self.snap.append((self.g, self.y, self.r))
+    def green(self, on): super().green(on); self._rec()
+    def yellow(self, on): super().yellow(on); self._rec()
+    def red(self, on): super().red(on); self._rec()
+
+
+_t0 = M.time
+_c = types.SimpleNamespace(t=100.0)
+M.time = types.SimpleNamespace(monotonic=lambda: _c.t, sleep=lambda s: None)
+_o = M.STATUS.event; M.STATUS.event = lambda m: None
+try:
+    d = FakeDrive(); l = _Led3()
+    n = M.Nav(d, FakeVision([None]), l, _Open())
+    n._enter(M.AT_VICTIM)
+    n.arrived_at = _c.t
+    frames, t_end = [], None
+    for _i in range(400):
+        _c.t += 0.05
+        n._at_victim()
+        if n.state != M.AT_VICTIM:
+            t_end = _c.t - 100.0
+            break
+        frames.append((l.g, l.y, l.r))
+    check(f"it stays put and 'collects' for 5 s (took {t_end:.2f} s)", t_end is not None and 4.9 <= t_end <= 5.2)
+    check("...with the drive stopped throughout", d.last == (0.0, 0.0))
+    check("...all three LEDs always in step: all lit or all dark",
+          all(f in ((True, True, True), (False, False, False)) for f in frames))
+    check("...and they actually flash (both states, many times)",
+          frames.count((True, True, True)) >= 20 and frames.count((False, False, False)) >= 20)
+    flips = sum(1 for a, b in zip(frames, frames[1:]) if a != b)
+    check(f"...at about {M.COLLECT_FLASH_HZ:g} Hz ({flips / 2 / 5:.1f} Hz)",
+          abs(flips / 2 / 5 - M.COLLECT_FLASH_HZ) < 0.8)
+    check("when it's done it has the victim and is heading home", n.carrying and n.state == M.RETURN)
+    check("...red alone, solid, for the trip home",
+          l.r is True and not l.g and not l.y)
+finally:
+    M.time = _t0
+    M.STATUS.event = _o
 
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)

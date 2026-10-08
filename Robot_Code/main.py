@@ -334,7 +334,12 @@ GRID_PIVOT_RATE = 2.8
 
 # --- rescue placeholders -- Roger's mechanism replaces these ------------------
 SEEK_ATTEMPTS = 2           # tries at a victim cell whose sonar check fails
-RESCUE_TIME_S = 3.0         # "collecting" at the victim, green LED
+# STAND-IN for the collection mechanism (Roger's): on reaching a victim the robot stands
+# still for RESCUE_TIME_S with ALL THREE LEDs flashing together, then it has the victim
+# "aboard" and drives home with the red LED on. When the real mechanism arrives, replace
+# RescueStub's start()/done() and the flashing in Nav._at_victim with its real calls.
+RESCUE_TIME_S = 5.0
+COLLECT_FLASH_HZ = 3.0      # all-LED flash while "collecting"
 # --test-mode: the collection mechanism isn't on the robot yet. On reaching a victim (stopped
 # STOP_DISTANCE_M short) it just stops there and flashes the yellow LED -- no collecting, no
 # trip home -- until the demo time runs out or you quit. Green stays on: it has found one.
@@ -2508,7 +2513,9 @@ class Nav:
         self.drive.set_velocity(CREEP_SPEED, w)
 
     def _at_victim(self):
-        """Stopped 10 cm short, green LED on, collecting. Then home with it."""
+        """Stopped 10 cm short. The (mock) collection: stand still RESCUE_TIME_S with all
+        three LEDs flashing together, then it has the victim and heads home (red on).
+        --test-mode instead stays here flashing yellow."""
         self.drive.stop()
         if TEST_MODE:
             # No rescue mechanism: stay put, flash yellow where the collecting would be.
@@ -2520,6 +2527,11 @@ class Nav:
             self.leds.yellow(int(time.monotonic() * TEST_MODE_FLASH_HZ * 2) % 2 == 0)
             return
         if not self.rescue.done():
+            # "Collecting": all three LEDs flash together, in step.
+            on = int(time.monotonic() * COLLECT_FLASH_HZ * 2) % 2 == 0
+            self.leds.green(on)
+            self.leds.yellow(on)
+            self.leds.red(on)
             return
         # Remember where it was, for the map: just ahead of where we stopped.
         reach = STOP_DISTANCE_M + CELL_M / 2 - FRONT_WALL_AT_CENTRE_M

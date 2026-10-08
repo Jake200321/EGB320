@@ -528,22 +528,34 @@ def sample(n):
 nav, world, leds, states, events, legs, t = run_mission(MAZE_1_WALLS, [(2, 2), (2, 1), (5, 5)],
                                                         stop_when=sample)
 def colour(g, y, r):
-    return "G" if g and not y and not r else "Y" if y and not g and not r else \
-           "R" if r and not g and not y else "-" if not (g or y or r) else "?"
+    return "A" if g and y and r else "G" if g and not y and not r else \
+           "Y" if y and not g and not r else "R" if r and not g and not y else \
+           "-" if not (g or y or r) else "?"
 seq = [colour(*s[2:]) for s in samples]
-check(f"never more than one LED lit at once ({seq.count('?')} ticks with a clash)", "?" not in seq)
+check(f"never a mixed state: one LED, none, or all three together ({seq.count('?')} odd ticks)",
+      "?" not in seq)
 check("yellow whenever it is searching",
       all(colour(*s[2:]) == "Y" for s in samples if s[0] == M.SEARCH))
-check("green whenever it is going to / closing on / collecting a victim",
-      all(colour(*s[2:]) == "G" for s in samples
-          if s[0] in (M.SEEK, M.APPROACH, M.CLOSING, M.AT_VICTIM)))
+check("green while it goes to / closes on a victim",
+      all(colour(*s[2:]) == "G" for s in samples if s[0] in (M.SEEK, M.APPROACH, M.CLOSING)))
+# (the first tick at a victim is still the solid green it arrived with; the flashing starts
+# on the next, so each visit's first sample is left out)
+in_victim = [colour(*s[2:]) for i, s in enumerate(samples)
+             if s[0] == M.AT_VICTIM and i > 0 and samples[i - 1][0] == M.AT_VICTIM]
+check("all three flash together while collecting (at the victim), and nothing else does",
+      all(k in ("A", "-") for k in in_victim)
+      and all(colour(*s[2:]) != "A" for s in samples if s[0] != M.AT_VICTIM))
+at_v = [colour(*s[2:]) for s in samples if s[0] == M.AT_VICTIM]
+check(f"...really flashing: {at_v.count('A')} lit ticks, {at_v.count('-')} dark ticks",
+      at_v.count("A") > 20 and at_v.count("-") > 20)
 check("red whenever it is taking a victim home, and ONLY then",
       all((colour(*s[2:]) == "R") == (s[0] in (M.RETURN, M.AT_BASE) and s[1]) for s in samples))
 check("yellow when heading home with nothing aboard",
       all(colour(*s[2:]) == "Y" for s in samples if s[0] == M.RETURN and not s[1]))
-runs = [k for i, k in enumerate(seq) if i == 0 or k != seq[i - 1]]
-check(f"each rescue shows yellow -> green -> red -> yellow ({''.join(runs)[:24]}...)",
-      "".join(runs).startswith("YGRYGRY"))
+folded = ["F" if k in ("A", "-") and s[0] == M.AT_VICTIM else k for k, s in zip(seq, samples)]
+runs = [k for i, k in enumerate(folded) if i == 0 or k != folded[i - 1]]
+check(f"each rescue shows yellow -> green -> flashing -> red -> yellow ({''.join(runs)[:20]}...)",
+      "".join(runs).startswith("YGFRYGFRY"))
 check("it's yellow from the very first tick", seq[0] == "Y")
 
 print(f"\n{'ALL PASSED' if not fails else f'{len(fails)} FAILED'}")
