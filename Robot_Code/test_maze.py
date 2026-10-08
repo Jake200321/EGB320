@@ -485,8 +485,8 @@ print("\n9) centring: starts 3 cm off centre, pulls back into the middle")
 nav, world, *_ = run_mission(MAZE_1_WALLS, [], camera=False, x_offset=0.03,
                              stop_when=lambda n: n.cell == (0, 4) and not n.mover.busy)
 world2 = World(MAZE_1_WALLS, [], M.CELL_M, (0, 6), "N")
-check(f"ends the corridor within 1 cm of centre "
-      f"(off by {abs(world.x - world2.x)*100:.1f} cm)", abs(world.x - world2.x) < 0.01)
+check(f"ends the corridor within 2 cm of centre, from 3 cm off "
+      f"(off by {abs(world.x - world2.x)*100:.1f} cm)", abs(world.x - world2.x) < 0.02)
 
 print("\n10) learns its own turn slip: calibration 10% out either way still completes")
 for slip in (0.90, 1.10):

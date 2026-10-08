@@ -200,10 +200,15 @@ STEER_WHILE_DRIVING = False
 TRIM_ENABLED = True         # False: no pivot trim at the start of a leg
 TRIM_TOL_RAD = 0.035        # ~2 deg: close enough to start the leg
 TRIM_PULSE_MIN_S = 0.02     # shortest / longest single pivot pulse
-TRIM_PULSE_MAX_S = 0.15
+TRIM_PULSE_MAX_S = 0.30     # a weak pivot needs a long pulse to move at all
 TRIM_SETTLE_S = 0.06        # stand still this long after a pulse so the encoders catch up
-TRIM_MAX_S = 1.2            # never spend longer than this squaring the heading up
-TRIM_MAX_PULSES = 8
+TRIM_MAX_S = 3.0            # never spend longer than this squaring the heading up
+TRIM_MAX_PULSES = 14
+# A turn that stops well short is NOT finished: driving off then points the leg at a wall (a
+# 90 deg corner left 58 deg undone, it drove into the wall, marked it blocked and lost the
+# route home). Keep turning instead, up to this many more rounds.
+TURN_RETRY_ERR_RAD = 0.35   # ~20 deg
+TURN_MAX_RETRIES = 8
 # Lean the leg towards the corridor centre: aim this far off the cardinal heading,
 # atan(offset / lead), so it arrives on the centreline. Next leg squares it up again.
 CENTRE_AIM_LEAD_M = 0.28
@@ -319,7 +324,12 @@ SIDE_SONAR_FORWARD_M = 0.0
 SEARCH_TURN_RATE = 2.4      # rad/s, the fastest it spins
 TURN_GAIN = 3.0             # rad/s per rad left to turn, floored at MIN_TURN_RATE_PIVOT
 TURN_TOLERANCE_RAD = 0.06   # ~3.4 deg: close enough, the drive's heading hold finishes it
-TURN_TIMEOUT_S = 4.0
+TURN_TIMEOUT_S = 10.0       # a weak pivot is slow (a quarter turn took >4 s); keep turning
+# Pivots in the maze (turning at corners, setting the heading) run at FULL power: the tracks
+# scrub on carpet and the motors are short of torque, so a gentler pivot just stalls. 2.8
+# rad/s is above the 2.65 that already saturates the board, i.e. raw 127. (The victim
+# approach keeps its own, gentler rates above.)
+GRID_PIVOT_RATE = 2.8
 
 # --- rescue placeholders -- Roger's mechanism replaces these ------------------
 SEEK_ATTEMPTS = 2           # tries at a victim cell whose sonar check fails
@@ -911,6 +921,7 @@ class Mover:
         self.drive, self.sonar, self.odo = drive, sonar, odo
         self.camera_view = camera_view      # () -> fresh wallvision.WallView or None
         self.trim_eff = 1.0                 # learned: real turn per commanded turn, per pulse
+        self.turn_retries = 0               # rounds of "turn again" used on this move
         self.phase = self.IDLE
         self.lateral = None                         # m right of centre, for the HUD
         self.near_since = None
@@ -934,6 +945,7 @@ class Mover:
         """
         self.target, self.heading, self.grid = (x, y), heading, grid
         self.through = through
+        self.turn_retries = 0
         self._yaw_stamp = None          # last wall view the heading was nudged by
         self.near_since = None          # when it came within ARRIVE_SLOW_M
         self.block_count = 0
@@ -988,11 +1000,18 @@ class Mover:
             self._begin_drive(now)
             return None
         if self.trim_pulses >= TRIM_MAX_PULSES or now - self.phase_started > TRIM_MAX_S:
+            if abs(err) > TURN_RETRY_ERR_RAD and self.turn_retries < TURN_MAX_RETRIES:
+                self.turn_retries += 1
+                STATUS.event(f"[nav] the turn stopped {math.degrees(err):+.0f} deg short -- turning "
+                             f"again ({self.turn_retries}/{TURN_MAX_RETRIES}), not driving off")
+                self.phase, self.turn_sign = self.TURN, None
+                self.phase_started = now
+                return None
             STATUS.event(f"[nav] heading trim gave up: {math.degrees(err):+.1f} deg still off "
                          f"after {self.trim_pulses} pulses -- driving on")
             self._begin_drive(now)
             return None
-        rate = MIN_TURN_RATE_PIVOT
+        rate = GRID_PIVOT_RATE
         pulse = _clamp(abs(err) / (rate * max(self.trim_eff, 0.05)), TRIM_PULSE_MAX_S)
         pulse = max(TRIM_PULSE_MIN_S, pulse)
         self.drive.set_velocity(0.0, math.copysign(rate, err))
@@ -1047,8 +1066,7 @@ class Mover:
             else:
                 self._begin_leg(now)
             return None
-        rate = min(SEARCH_TURN_RATE, max(MIN_TURN_RATE_PIVOT, TURN_GAIN * abs(err)))
-        self.drive.set_velocity(0.0, math.copysign(rate, err))
+        self.drive.set_velocity(0.0, math.copysign(GRID_PIVOT_RATE, err))
         return None
 
     def _begin_align(self, now):

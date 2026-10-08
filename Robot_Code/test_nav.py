@@ -1385,5 +1385,45 @@ n._trace_stop(["front", "left", "right"])
 check("...and only once per cell", len(_ev) == 1)
 M.STATUS.event = _o
 
+print("30) weak motors: full-power pivots, and a turn that stops short keeps turning")
+check("maze pivots run at full power (raw 127)",
+      MOT.to_raw(MOT.wheel_speeds(0.0, M.GRID_PIVOT_RATE)[0]) == -MOT.MAX_SPEED_RAW)
+check("...the victim approach keeps its gentler floor", M.MIN_TURN_RATE_PIVOT < M.GRID_PIVOT_RATE)
+check("a turn is given long enough to finish a weak pivot", M.TURN_TIMEOUT_S >= 8.0)
+
+_ev = []
+_o = M.STATUS.event; M.STATUS.event = lambda m: _ev.append(m)
+n, d, robot, ticks = trim_run(-58.0, eff=0.02)    # nothing it does turns the robot much
+check("a trim that can't finish a big error does NOT drive off: it turns again",
+      n.mover.phase == M.Mover.TURN and any("turning again (1/" in e for e in _ev))
+check("...it said how far short it was (about 58 deg)",
+      any("deg short" in e and "turning again" in e and ("57" in e or "58" in e) for e in _ev))
+check("...and that doesn't loop forever: it's bounded by TURN_MAX_RETRIES",
+      M.TURN_MAX_RETRIES >= 1)
+
+# once the retries are used up it does drive on (a robot that can't turn at all mustn't hang)
+_ev.clear()
+d2 = LogDrive()
+n2 = M.Nav(d2, FakeVision([None]), FakeLeds(), _Open())
+robot2 = _Robot(n2, d2, stuck=True)
+_real_time = M.time
+M.time = types.SimpleNamespace(monotonic=robot2.monotonic, sleep=robot2.sleep)
+try:
+    n2.odo.theta = M.HEADING_RAD[1] - math.radians(80)
+    n2.mover.grid, n2.mover.heading, n2.mover.target = True, M.HEADING_RAD[1], (0.42, 0.14)
+    n2.mover.through, n2.mover.turn_retries = False, 0
+    n2.mover._front_stamp = None
+    n2.mover._begin_trim(robot2.t)
+    for _i in range(4000):
+        n2.mover.update()
+        robot2.sleep(0.05)
+        if n2.mover.phase == M.Mover.DRIVE:
+            break
+finally:
+    M.time = _real_time
+check("a robot that never turns, after all the retries, drives on rather than hanging",
+      n2.mover.phase == M.Mover.DRIVE and n2.mover.turn_retries == M.TURN_MAX_RETRIES)
+M.STATUS.event = _o
+
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)
