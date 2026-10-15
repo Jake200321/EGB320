@@ -1732,6 +1732,7 @@ class Nav:
         self.closing_heading = None  # heading CLOSING holds
         self.rescued = 0
         self._mock_announced = None       # arrived_at of the victim the mock collection announced
+        self._edge_warned = set()         # (cell, heading) map-edge openings already reported
         self._creeping = False           # a short creep up to the front wall is under way
         self._creeped_cell = None
         self._victim_seen_at = -1e9      # when the camera last saw a victim
@@ -2142,6 +2143,27 @@ class Nav:
                      "is walled -- marked on the map")
         self.map.set_wall(self.cell, self.move_heading, True, lock=True)
 
+    def _check_edge_is_open(self, heading, d, window_edge):
+        """Warn, once per edge, when the sonar sees clear space where the map says the maze ends.
+
+        The map's outer edge is a locked wall, so an opening there is ignored. If the robot
+        is genuinely looking out of the maze, it's the base cell / heading that's wrong.
+        """
+        if self.map.in_bounds(self.map.neighbour(self.cell, heading)):
+            return
+        if d is not None and d < window_edge + 0.10:
+            return                                 # a wall, or close enough to be one
+        key = (self.cell, heading)
+        if key in self._edge_warned:
+            return
+        self._edge_warned.add(key)
+        seen = "no echo within range" if d is None else f"{d*100:.0f}cm of open space"
+        STATUS.event(f"[map] WARNING: {self.cell} {HEADING_NAME[heading]} is the edge of the map "
+                     f"(treated as a solid wall) but the sonar sees {seen}. If that's a real "
+                     f"opening the base cell or heading is wrong: current base {self.base_cell} "
+                     f"facing {HEADING_NAME[self.facing]}; try --base-cell col,row "
+                     "--start-heading N/E/S/W")
+
     def _record_walls(self, fitted):
         """Map the three sides it can see from this cell centre."""
         for name, heading in (("front", self.facing), ("left", LEFT_OF[self.facing]),
@@ -2158,6 +2180,7 @@ class Nav:
                 # victim standing just beyond the boundary -- don't seal it off.
                 window = VICTIM_WALL_WINDOW_M
             present = d is not None and d < at_centre + window
+            self._check_edge_is_open(heading, d, at_centre + window)
             if (not present and self._camera_sees_wall(name)
                     and self.map.neighbour(self.cell, heading) != self.victim_cell):
                 shown = "no echo" if d is None else f"{d*100:.0f}cm"

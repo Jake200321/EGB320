@@ -1554,6 +1554,27 @@ check("with the minimum off it's plain proportional again (a small error -> smal
       0.0 < abs(steer_w(4.0)) < M.STEER_MIN_RATE + 0.5 and abs(steer_w(4.0)) < 0.4)
 M.STEER_MIN_RATE = _DEFAULT_MINRATE
 
+print("36) the map's outer edge: say so when the sonar sees open space where the map ends")
+_ev = []
+_o = M.STATUS.event; M.STATUS.event = lambda m: _ev.append(m)
+n = M.Nav(FakeDrive(), FakeVision([None]), FakeLeds(), _Open())    # base (0, 6): west is the edge
+n.cell, n.facing = (0, 4), 0
+n.sense_from = {k: 0.0 for k in ("front", "left", "right")}
+n._check_edge_is_open(M.WEST if hasattr(M, "WEST") else 3, 0.55, 0.159)
+check("open space (55 cm) where the map says the edge is -> warns, naming base cell and the flags",
+      any("edge of the map" in e and "--base-cell" in e and "55cm" in e for e in _ev))
+_ev.clear()
+n._check_edge_is_open(3, 0.55, 0.159)
+check("...only once per edge", not _ev)
+_ev.clear()
+n._check_edge_is_open(3, 0.07, 0.159)
+check("a wall there (7 cm) -> nothing said", not _ev)
+n2 = M.Nav(FakeDrive(), FakeVision([None]), FakeLeds(), _Open())
+n2.cell, n2.facing = (3, 3), 0
+n2._check_edge_is_open(3, 0.55, 0.159)
+check("an interior edge isn't the map's edge -> nothing said", not _ev)
+M.STATUS.event = _o
+
 print("32) status LEDs, per the project description")
 # Yellow = searching/exploring. Green = victim detected & collection in progress.
 # Red = returning to base with a victim. Exactly one lit at a time; none when finished.
