@@ -162,7 +162,10 @@ TICKS_PER_M = 10530.0
 # Track width the ODOMETRY uses for heading. Wider than the 123 mm sprocket spacing
 # because the tracks skid sideways to rotate, and the encoders count the full track
 # travel regardless. If 90 degree turns come out short or long, --calibrate turn.
-EFFECTIVE_TRACK_M = 0.16
+# MEASURED 2026-10-15, new motors: the encoders counted 360 deg and the robot really turned
+# 350, so 0.16 * 360 / 350 = 0.1646. (0.3291 from 2026-10-01 was the old, torque-starved
+# motors with only one track really turning -- not comparable.)
+EFFECTIVE_TRACK_M = 0.1646
 
 # --- sonar geometry: MEASURE with  python3 main.py --calibrate sonar -----------
 # What each sonar reads with the robot centred in a cell and a wall right there.
