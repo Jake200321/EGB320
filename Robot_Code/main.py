@@ -165,16 +165,8 @@ EFFECTIVE_TRACK_M = 0.16
 
 # --- sonar geometry: MEASURE with  python3 main.py --calibrate sonar -----------
 # What each sonar reads with the robot centred in a cell and a wall right there.
-#
-# RE-DERIVED 2026-10-15 when the sonar names were corrected. The calibration print-out was
-# front 6.0 / left 8.1 / right 7.6 cm under the OLD (crossed) names, where "front" was the
-# real left sensor, "left" the real right and "right" the real front. By where they really
-# sit: front 7.6, left 6.0, right 8.1. The sides are averaged ((6.0 + 8.1) / 2 = 7.05) -- the
-# 2 cm left/right gap may be the mounting or the robot not being quite centred, and one
-# number can't tell. Re-run  python3 main.py --calibrate sonar  (dead centre, walls all
-# round) to confirm: it now labels them correctly.
-FRONT_WALL_AT_CENTRE_M = 0.076
-SIDE_WALL_AT_CENTRE_M = 0.0705
+FRONT_WALL_AT_CENTRE_M = 0.060
+SIDE_WALL_AT_CENTRE_M = 0.079
 # A wall counts as present when the reading is within this of those. Deliberately
 # tight rather than half a cell: a victim or rubble standing in the NEXT cell reads
 # ~15 cm, and calling that a wall would seal off the very cell the victim is in.
