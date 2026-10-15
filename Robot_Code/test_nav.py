@@ -1147,21 +1147,22 @@ ok, out = _step6("")
 check("no answer -> doesn't pretend to judge", ok is None)
 
 print("25d) the shipped motor wiring: named tracks land on the right physical motors")
-# Measured: board channel 1 drives the physical RIGHT motor, channel 2 the physical LEFT,
-# and driving forward needs +ch1 / -ch2. Whatever the SWAP/SIGN/TRIM values are, this must
+# Measured: board channel 1 drives the physical RIGHT motor, channel 2 the physical LEFT.
+# With the NEW motors (2026-10-15) both turn forward on a positive command (the new left
+# motor needed LEFT_SIGN flipped to +1). Whatever the SWAP/SIGN/TRIM values are, this must
 # hold for the config that ships, or a "turn left" turns the robot right.
 _fbw = _FakeBoard()
 _dw = MOT.MotorDriver(controller=_fbw)
 _t = (MOT.LEFT_TRIM, MOT.RIGHT_TRIM)
 MOT.LEFT_TRIM = MOT.RIGHT_TRIM = 1.0
 _dw.set_raw(100, 100)
-check("both tracks forward = (+ch1, -ch2) -- what actually drives the robot straight",
-      _fbw.sent[0] > 0 > _fbw.sent[1] and abs(_fbw.sent[0]) == abs(_fbw.sent[1]))
+check("both tracks forward = (+ch1, +ch2) -- what drives the new motors straight",
+      _fbw.sent[0] > 0 and _fbw.sent[1] > 0 and abs(_fbw.sent[0]) == abs(_fbw.sent[1]))
 _dw.set_raw(-100, 100)                                 # LEFT pivot: left back, right forward
 check("a LEFT pivot drives the physical RIGHT motor (ch1) forward and the LEFT (ch2) back",
-      _fbw.sent[0] > 0 and _fbw.sent[1] > 0)
+      _fbw.sent[0] > 0 > _fbw.sent[1])
 _dw.set_raw(100, -100)                                 # RIGHT pivot
-check("a RIGHT pivot is the reverse", _fbw.sent[0] < 0 and _fbw.sent[1] < 0)
+check("a RIGHT pivot is the reverse", _fbw.sent[0] < 0 < _fbw.sent[1])
 _dw.set_raw(100, 0)                                    # only the named LEFT track
 check("the named LEFT track alone is the physical left motor (ch2)",
       _fbw.sent[0] == 0 and _fbw.sent[1] != 0)

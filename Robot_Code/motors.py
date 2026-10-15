@@ -65,7 +65,11 @@ MAX_WHEEL_RPM = 130.0
 # Measured 2026-10-01 with motor_spin_test.py: board channel 1 drives the physical RIGHT
 # motor and channel 2 the physical LEFT, and the driving direction needs +ch1 / -ch2. With
 # SWAP_MOTORS on, that's LEFT_SIGN = -1 (-> ch2) and RIGHT_SIGN = +1 (-> ch1).
-LEFT_SIGN = -1
+#
+# NEW MOTORS (2026-10-15): motor_spin_test.py showed the left motor spinning the wrong way
+# and the right one the right way, so LEFT_SIGN is flipped to +1 -- the new left motor is
+# mounted/wired the other way round to the old one. RIGHT_SIGN stays +1.
+LEFT_SIGN = 1
 RIGHT_SIGN = 1
 
 # ---- ENCODER DIRECTION -- separate from the motors' ---------------------------
