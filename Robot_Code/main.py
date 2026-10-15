@@ -153,11 +153,12 @@ TEST_MODE_VICTIMS = 1       # --test-mode: one victim, home, done
 EXPLORE_PREFER_RIGHT = True
 
 # --- odometry: MEASURE with  python3 main.py --calibrate straight / turn -------
-# Encoder ticks per metre of track travel. MEASURED 2026-10-01: 2.5 s straight drive,
-# 7687 ticks (mean of both tracks) over 68 cm -> 11300. (The theoretical 18570 -- 1400
-# counts per output rev over a 24 mm sprocket -- was out by 1.6x.) Re-measure with
-# python3 main.py --calibrate straight if the tracks or the floor change.
-TICKS_PER_M = 11300.0
+# Encoder ticks per metre of track travel. MEASURED 2026-10-15 with the NEW motors: 2.5 s
+# straight drive, left 5874 / right 5920 ticks (mean 5897) over 56 cm -> 10530. (The old
+# motors gave 11300 on 2026-10-01; the theoretical 18570 -- 1400 counts per output rev over a
+# 24 mm sprocket -- was out by 1.6x.) Re-measure with python3 main.py --calibrate straight if
+# the tracks, motors or the floor change.
+TICKS_PER_M = 10530.0
 # Track width the ODOMETRY uses for heading. Wider than the 123 mm sprocket spacing
 # because the tracks skid sideways to rotate, and the encoders count the full track
 # travel regardless. If 90 degree turns come out short or long, --calibrate turn.
