@@ -28,10 +28,11 @@ import argparse
 import time
 
 # BCM numbering -- must match ULTRASONIC_PINS in main.py
+# Names are where the sensor really sits on the robot (corrected 2026-10-15).
 SENSOR_PINS = {
-    "left":  (5, 6),      # (TRIG, ECHO)
-    "front": (23, 24),
-    "right": (22, 27),
+    "left":  (23, 24),    # (TRIG, ECHO)
+    "front": (22, 27),
+    "right": (5, 6),
 }
 DISPLAY_ORDER = ["left", "front", "right"]
 

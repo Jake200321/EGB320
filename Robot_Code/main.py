@@ -79,15 +79,18 @@ RED_LED_BCM = 21            # returning to base -- wired, not yet driven by the 
 # *** ECHO IS A 5 V OUTPUT AND PI GPIO IS 3.3 V ONLY ***
 # Wire each ECHO through a divider (1k in series, 2k to ground) or you will
 # eventually damage the pin. TRIG is an input to the sensor and is fine direct.
-# Right was on (20, 21) until the LEDs claimed those; moved to (22, 27).
+# (Right was once on (20, 21) until the LEDs claimed those.)
+# The names are WHERE THE SENSOR SITS ON THE ROBOT, looking from behind it. They were once
+# crossed -- fixed 2026-10-15 after the sensors were found mixed up: the sensor at the real
+# front is on 22/27, the real left on 23/24, the real right on 5/6.
 # Full pin map -- keep these disjoint:
 #   I2C to the motor HAT   2, 3
 #   LEDs                   16 green, 20 yellow, 21 red
-#   ultrasonics            23/24 front, 5/6 left, 22/27 right
+#   ultrasonics            22/27 front, 23/24 left, 5/6 right
 ULTRASONIC_PINS = {
-    "front": (23, 24),
-    "left":  (5, 6),
-    "right": (22, 27),
+    "front": (22, 27),
+    "left":  (23, 24),
+    "right": (5, 6),
 }
 # Only these are pinged. Pinging a sensor that isn't there costs a full echo timeout
 # (~22 ms) every time its turn comes round, so take one out here if it's unplugged.
@@ -162,8 +165,16 @@ EFFECTIVE_TRACK_M = 0.16
 
 # --- sonar geometry: MEASURE with  python3 main.py --calibrate sonar -----------
 # What each sonar reads with the robot centred in a cell and a wall right there.
-FRONT_WALL_AT_CENTRE_M = 0.060
-SIDE_WALL_AT_CENTRE_M = 0.079
+#
+# RE-DERIVED 2026-10-15 when the sonar names were corrected. The calibration print-out was
+# front 6.0 / left 8.1 / right 7.6 cm under the OLD (crossed) names, where "front" was the
+# real left sensor, "left" the real right and "right" the real front. By where they really
+# sit: front 7.6, left 6.0, right 8.1. The sides are averaged ((6.0 + 8.1) / 2 = 7.05) -- the
+# 2 cm left/right gap may be the mounting or the robot not being quite centred, and one
+# number can't tell. Re-run  python3 main.py --calibrate sonar  (dead centre, walls all
+# round) to confirm: it now labels them correctly.
+FRONT_WALL_AT_CENTRE_M = 0.076
+SIDE_WALL_AT_CENTRE_M = 0.0705
 # A wall counts as present when the reading is within this of those. Deliberately
 # tight rather than half a cell: a victim or rubble standing in the NEXT cell reads
 # ~15 cm, and calling that a wall would seal off the very cell the victim is in.

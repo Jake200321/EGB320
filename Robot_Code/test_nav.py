@@ -1380,7 +1380,8 @@ n = creep_nav(_half + 0.10)
 n.sense_from = {k: 0.0 for k in ("front", "left", "right")}
 n._trace_stop(["front", "left", "right"])
 check("each stop prints one trace line with the sonar readings and the odometry offset",
-      len(_ev) == 1 and "[stop]" in _ev[0] and "odo off centre" in _ev[0] and "F 16" in _ev[0])
+      len(_ev) == 1 and "[stop]" in _ev[0] and "odo off centre" in _ev[0]
+      and f"F {(M.FRONT_WALL_AT_CENTRE_M + 0.10) * 100:.0f}" in _ev[0])
 n._trace_stop(["front", "left", "right"])
 check("...and only once per cell", len(_ev) == 1)
 M.STATUS.event = _o
@@ -1615,6 +1616,19 @@ try:
 finally:
     M.time = _t0
     M.STATUS.event = _o
+
+print("34) ultrasonic pins: each name is where the sensor really sits")
+# The sensors were found crossed: the real LEFT was on 23/24 (named "front"), the real RIGHT
+# on 5/6 (named "left"), the real FRONT on 22/27 (named "right"). Pinned so it can't slip back.
+check("front sensor is on 22/27", M.ULTRASONIC_PINS["front"] == (22, 27))
+check("left sensor is on 23/24", M.ULTRASONIC_PINS["left"] == (23, 24))
+check("right sensor is on 5/6", M.ULTRASONIC_PINS["right"] == (5, 6))
+check("no two sensors share a pin (and none uses the LEDs' 16/20/21 or I2C's 2/3)",
+      len({p for pair in M.ULTRASONIC_PINS.values() for p in pair}) == 6
+      and not ({p for pair in M.ULTRASONIC_PINS.values() for p in pair} & {16, 20, 21, 2, 3}))
+import ultrasonic_test as _UT
+check("ultrasonic_test.py uses the same pins as main.py",
+      all(_UT.SENSOR_PINS[k] == M.ULTRASONIC_PINS[k] for k in ("front", "left", "right")))
 
 print(f"\n{len(fails)} failed")
 sys.exit(1 if fails else 0)
