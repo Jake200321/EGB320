@@ -22,7 +22,9 @@ import motors as MOT
 # chassis can't steer by a speed difference -- see STEER_WHILE_DRIVING), and section 27
 # tests those. The defaults are saved here and restored there.
 _DEFAULT_STEER, _DEFAULT_TRIM = M.STEER_WHILE_DRIVING, M.TRIM_ENABLED
+_DEFAULT_MINRATE = M.STEER_MIN_RATE
 M.STEER_WHILE_DRIVING, M.TRIM_ENABLED = True, False
+M.STEER_MIN_RATE = 0.0            # plain proportional steering, as these tests were written
 
 
 # --------------------------------------------------------------------- fakes
@@ -1194,7 +1196,10 @@ check("camera walls are OFF by default", M.USE_CAMERA_WALLS is False)
 
 print("27) the shipped motion: no steering while driving, pivot pulses set the heading")
 M.STEER_WHILE_DRIVING, M.TRIM_ENABLED = _DEFAULT_STEER, _DEFAULT_TRIM
-check("defaults: no differential steering while driving", _DEFAULT_STEER is False)
+M.STEER_MIN_RATE = _DEFAULT_MINRATE
+check("defaults: steering while driving is ON (the new motors steer)", _DEFAULT_STEER is True)
+check("defaults: steering has a minimum correction to clear the motors' dead band",
+      M.STEER_MIN_RATE > 0.0)
 check("defaults: heading trim on", _DEFAULT_TRIM is True)
 
 
@@ -1517,6 +1522,37 @@ for _tm, _want_done in ((True, True), (False, False)):
           (n.state == M.DONE and any("TEST MODE" in e and "1 victim rescued" in e for e in _ev2))
           if _want_done else n.state == M.SEARCH)
 check("--test-mode's target is one victim", M.TEST_MODE_VICTIMS == 1)
+
+print("35) steering while driving on the new motors: a minimum correction clears the dead band")
+
+
+def steer_w(heading_err_deg):
+    """The yaw rate the leg commands with the robot `heading_err_deg` off (centred, east)."""
+    d = LogDrive()
+    n = M.Nav(d, FakeVision([None]), FakeLeds(), _Sides(_half, _half))
+    n.odo.theta = M.HEADING_RAD[1] + math.radians(heading_err_deg)
+    n.mover.grid, n.mover.heading = True, M.HEADING_RAD[1]
+    n.mover.target, n.mover.through = (n.odo.x + 0.28, n.odo.y), False
+    n.mover._front_stamp = None
+    n.mover._begin_drive(time.monotonic())
+    n.mover.update()
+    return d.log[-1][1]
+
+
+check("defaults: STEER_MIN_RATE is 0.5 rad/s", M.STEER_MIN_RATE == 0.5)
+check("1 deg off: inside the tolerance, left alone", steer_w(1.0) == 0.0)
+w = steer_w(-4.0)
+check(f"4 deg right of heading: turns LEFT at least the minimum ({w:+.2f} rad/s)",
+      w >= M.STEER_MIN_RATE - 1e-9)
+w = steer_w(4.0)
+check(f"4 deg left of heading: turns RIGHT at least the minimum ({w:+.2f} rad/s)",
+      w <= -M.STEER_MIN_RATE + 1e-9)
+check("a big error still just uses the proportional command, capped at MAX_STEER_RATE",
+      abs(steer_w(40.0)) <= M.MAX_STEER_RATE + 1e-9 and abs(steer_w(40.0)) >= M.STEER_MIN_RATE)
+M.STEER_MIN_RATE = 0.0
+check("with the minimum off it's plain proportional again (a small error -> small command)",
+      0.0 < abs(steer_w(4.0)) < M.STEER_MIN_RATE + 0.5 and abs(steer_w(4.0)) < 0.4)
+M.STEER_MIN_RATE = _DEFAULT_MINRATE
 
 print("32) status LEDs, per the project description")
 # Yellow = searching/exploring. Green = victim detected & collection in progress.

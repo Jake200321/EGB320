@@ -198,14 +198,22 @@ ODO_MIN_SHARE = 0.4
 BLOCK_MARGIN_M = 0.05
 BLOCK_CONFIRM = 3
 
-# STEERING WHILE DRIVING DOES NOTHING on this robot. Measured (straight_test.py step 5):
-# with the right track commanded 70 raw above the left -- left at 45, barely moving by
-# itself -- both tracks still ran at the same ~0.10 m/s and the robot turned ~4 deg/s. The
-# chassis forces the tracks to one speed, so a speed difference while driving can't steer;
-# only a pivot (tracks counter-rotating) can. So: drive straight with no yaw command, and
-# set the heading with short pivot pulses at the start of every leg (TRIM below), with the
-# encoder heading as the feedback. Set True to bring the old differential steering back.
-STEER_WHILE_DRIVING = False
+# STEERING WHILE DRIVING. On the OLD motors it did nothing (straight_test.py step 5, 2026-10-01:
+# the right track commanded 70 raw above the left, both tracks still ran at ~0.10 m/s and the
+# robot turned ~4 deg/s -- the chassis locked them together), so it was off and the heading was
+# set with pivot pulses at the start of each leg (TRIM below). The NEW motors steer (46% of a
+# commanded turn, table below), so it's back ON; the leg-start pivot trim stays. Set False for
+# pivot pulses only.
+STEER_WHILE_DRIVING = True
+# The NEW motors (straight_test.py step 5, 2026-10-15) DO steer by a speed difference, but with
+# a dead band: under ~25 raw of difference the yaw is ~2 deg/s, then 6 deg/s at 30, 9 at 40, 15
+# at 50, 30 at 70. So a small heading error asks for a correction the motors don't deliver.
+# When steering while driving, any error worth correcting (over STEER_TOL_RAD) is given at least
+# STEER_MIN_RATE, which clears the dead band, and smaller ones are left alone.
+STEER_MIN_RATE = 0.5        # rad/s; 0 = off (plain proportional steering). ~31 raw of
+                            # difference: past the dead band. Sim, measured response: wall
+                            # clearance 13 cm vs 11 (pulses only) on a clean run, 11 vs 7-9 with slip.
+STEER_TOL_RAD = 0.035       # ~2 deg
 TRIM_ENABLED = True         # False: no pivot trim at the start of a leg
 TRIM_TOL_RAD = 0.035        # ~2 deg: close enough to start the leg
 TRIM_PULSE_MIN_S = 0.02     # shortest / longest single pivot pulse
@@ -1231,7 +1239,11 @@ class Mover:
             self.lateral = (o.x - tx) * rx + (o.y - ty) * ry
         if STEER_WHILE_DRIVING or not self.grid:
             aim = self.heading + _clamp(CENTRE_GAIN * self.lateral, MAX_CENTRE_ANGLE)
-            w = _clamp(HEADING_HOLD_GAIN * wrap(aim - o.theta), MAX_STEER_RATE)
+            err = wrap(aim - o.theta)
+            w = _clamp(HEADING_HOLD_GAIN * err, MAX_STEER_RATE)
+            if STEER_MIN_RATE > 0.0:
+                w = (math.copysign(max(abs(w), STEER_MIN_RATE), err)
+                     if abs(err) > STEER_TOL_RAD else 0.0)
         else:
             w = 0.0                  # a speed difference can't steer this chassis (see above)
         v = SEARCH_SPEED if remaining > ARRIVE_SLOW_M or self.through else ARRIVE_SPEED

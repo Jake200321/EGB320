@@ -101,12 +101,28 @@ class Clock:
         return self.t
 
 
+# raw speed difference (right - left) -> yaw rate in deg/s, measured on the new motors
+_YAW_TABLE = [(0, 0.0), (10, 1.5), (20, 2.1), (30, 6.3), (40, 8.9), (50, 14.8), (70, 29.8),
+              (100, 60.0)]
+
+
+def _yaw_from_raw_diff(diff):
+    a = abs(diff)
+    for (x0, y0), (x1, y1) in zip(_YAW_TABLE, _YAW_TABLE[1:]):
+        if a <= x1:
+            deg = y0 + (y1 - y0) * (a - x0) / (x1 - x0)
+            break
+    else:
+        deg = _YAW_TABLE[-1][1]
+    return math.copysign(math.radians(deg), diff)
+
+
 class World:
     """The true robot and maze. Advances the pose from Nav's (v, w) command."""
 
     def __init__(self, walls, victims, cell_m, base, start_heading,
                  turn_slip=1.0, left_weak=1.0, noise=0.004, seed=1, x_offset=0.0,
-                 turn_jitter=0.0, locked_tracks=True, tick_scale=1.0):
+                 turn_jitter=0.0, locked_tracks=True, tick_scale=1.0, drive_steer=None):
         self.cell_m = cell_m
         self.segs = []
         size = COLS * cell_m
@@ -126,6 +142,9 @@ class World:
         # tracks run at the same speed whatever the commands (straight_test.py step 5).
         # Only a pivot (tracks counter-rotating) turns it.
         self.locked_tracks = locked_tracks
+        # "measured": steering while driving as the NEW motors really respond (straight_test.py
+        # step 5, 2026-10-15) -- a dead band, then yaw rate rising with the raw speed difference.
+        self.drive_steer = drive_steer
         # The encoders count this many times the track travel that really happens (wheel
         # slip, or TICKS_PER_M set too low): the odometry then thinks it has gone further
         # than it has and stops short.
@@ -149,7 +168,15 @@ class World:
         half = M_TRACK / 2.0
         vl, vr = v - w * half, v + w * half
         vl *= self.left_weak                             # ...and what they deliver
-        if self.locked_tracks and abs(v) > 1e-9:
+        if self.drive_steer == "measured" and abs(v) > 1e-9:
+            # what the commanded yaw really becomes while driving, via the raw difference
+            import motors as _MOT
+            lraw = _MOT.to_raw(v - w * half)
+            rraw = _MOT.to_raw(v + w * half)
+            real = _yaw_from_raw_diff(rraw - lraw)       # rad/s
+            vl, vr = v - real * half, v + real * half
+            vl *= self.left_weak
+        elif self.locked_tracks and abs(v) > 1e-9:
             vl = vr = (vl + vr) / 2.0                    # driving: the chassis equalises them
         # Encoders count track travel, whatever the chassis actually does.
         self.ticks[0] += vl * dt * M.TICKS_PER_M * self.tick_scale
@@ -575,6 +602,18 @@ check("announced the mock collection once", sum("TEST MODE" in e and "mock colle
                                                for e in events) == 1)
 check("LEDs: yellow -> green -> all flashing -> red home -> off at the end",
       any(k == "r" and on for k, on in leds.log) and not (leds.g or leds.y or leds.r))
+
+print("\n14) the new motors' measured steering response (dead band, then yaw rising with the difference)")
+for label, mz, vic in (("maze 1", MAZE_1_WALLS, [(2, 2), (2, 1), (5, 5)]),
+                       ("maze 2", MAZE_2_WALLS, [(4, 5), (5, 4), (0, 1)])):
+    nav, world, leds, states, events, legs, t = run_mission(mz, vic, drive_steer="measured",
+                                                            locked_tracks=False)
+    tm_ = true_map(mz, M.CELL_M)
+    wrong = sum(1 for h in nav.map.known_walls() if tm_.wall(*h) is not True)
+    check(f"{label}: all 3 collected and home ({nav.rescued} by {t:.0f}s), map right, no contact "
+          f"(closest {world.min_wall_gap*100:.1f} cm)",
+          nav.rescued == 3 and wrong == 0 and world.min_wall_gap > 0.07
+          and world.min_victim_gap > 0.15)
 
 print(f"\n{'ALL PASSED' if not fails else f'{len(fails)} FAILED'}")
 sys.exit(1 if fails else 0)
