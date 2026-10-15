@@ -121,9 +121,9 @@ SWAP_MOTORS = True
 # the heading is locked -- where nothing is correcting. While exploring, the
 # encoder straight-line correction already compensates for a track imbalance, so
 # a trim there just reduces how hard it has to work.
-# (These were tuned while the channels were swapped, so the 0.9 that was on "right" was
-# really on the physical LEFT track; it's carried over to LEFT now that the names are right.)
-LEFT_TRIM = 0.9
+# Both back to 1.0 on 2026-10-15 for the new motors (the 0.9 was the old motors', tuned while the
+# channels were swapped). Measure what the new ones need with  python3 straight_test.py --only 2.
+LEFT_TRIM = 1.0
 RIGHT_TRIM = 1.0
 # -------------------------------------------------------------------------------
 
